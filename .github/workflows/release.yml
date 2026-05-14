@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build x64 binaries
+        shell: pwsh
+        run: .\build.ps1 -Clean
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          $dist = Join-Path $PWD "dist"
+          $packageDir = Join-Path $dist "SuperLightBattery-$tag-win-x64"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+
+          Copy-Item -LiteralPath "out\SuperLightBattery.exe" -Destination $packageDir
+          Copy-Item -LiteralPath "out\SuperLightBatteryInstaller.exe" -Destination $packageDir
+          Copy-Item -LiteralPath "README.md" -Destination $packageDir
+          Copy-Item -LiteralPath "LICENSE" -Destination $packageDir
+
+          $zipPath = Join-Path $dist "SuperLightBattery-$tag-win-x64.zip"
+          Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $zipPath -Force
+
+          @"
+          SuperLightBattery $tag
+
+          Assets:
+          - SuperLightBattery-$tag-win-x64.zip: recommended download; contains the app, installer, README, and license.
+          - SuperLightBattery.exe: standalone CLI/tray executable.
+          - SuperLightBatteryInstaller.exe: tiny per-user installer/launcher; requires SuperLightBattery.exe next to it when installing.
+          "@ | Set-Content -LiteralPath (Join-Path $dist "release-notes.md") -Encoding UTF8
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag `
+            "dist/SuperLightBattery-$tag-win-x64.zip" `
+            "out/SuperLightBattery.exe" `
+            "out/SuperLightBatteryInstaller.exe" `
+            --title $tag `
+            --notes-file "dist/release-notes.md"

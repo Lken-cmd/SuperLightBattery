@@ -1,0 +1,44 @@
+# Build outputs
+build/
+out/
+dist/
+bin/
+obj/
+x64/
+x86/
+Debug/
+Release/
+
+# Native debug artifacts
+*.pdb
+*.ilk
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+
+# Local editor and OS files
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Local configuration and secrets
+.env
+.env.*
+*.local
+secrets.*
+
+# Logs, dumps, and captures
+*.log
+*.dmp
+*.mdmp
+*.etl
+*.pcap
+*.pcapng
+*.cap

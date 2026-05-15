@@ -2,16 +2,16 @@
 
 A tiny Windows battery indicator for Logitech LIGHTSPEED mice — no G HUB, no service, no telemetry.
 
-SuperLightBattery shows the battery level of a Logitech LIGHTSPEED mouse (PRO X Superlight family and similar HID++ 2.0 devices) in the system tray. Two small executables, statically linked, no background framework. Tested on Windows 11.
+SuperLightBattery shows the battery level of a Logitech LIGHTSPEED mouse (PRO X Superlight family and similar HID++ 2.0 devices) in the system tray. Small native binaries, statically linked, no background framework. Tested on Windows 11.
 
 ## Install
 
 1. Download the latest release zip from the [Releases](https://github.com/Lken-cmd/SuperLightBattery/releases) page.
-2. Unzip it anywhere. Keep `SuperLightBattery.exe` and `SuperLightBatteryInstaller.exe` next to each other.
+2. Unzip it anywhere. Keep `SuperLightBattery.exe`, `SuperLightBatteryLauncher.exe`, and `SuperLightBatteryInstaller.exe` next to each other.
 3. Run `SuperLightBatteryInstaller.exe`.
 4. Click **Install**. The tray icon appears, and the app starts automatically at every logon from then on.
 
-No admin rights are required. Files go to `%LOCALAPPDATA%\SuperLightBattery` and one value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+No admin rights are required. Files go to `%LOCALAPPDATA%\SuperLightBattery` and a `SuperLightBattery` shortcut is added to the current user's Startup folder.
 
 ## Use
 
@@ -39,7 +39,7 @@ Run the installer again and click **Uninstall**, or:
 SuperLightBatteryInstaller.exe --uninstall
 ```
 
-This deletes the files, removes the registry entry, and stops the running tray. If a file is locked because the tray is still active, the installer schedules it for deletion at next reboot.
+This deletes the files, removes the startup shortcut, cleans up any old registry startup entry, and stops the running tray. If a file is locked because the tray is still active, the installer schedules it for deletion at next reboot.
 
 ## CLI
 
@@ -49,7 +49,6 @@ For scripting and one-off checks, `SuperLightBattery.exe` has a small CLI:
 SuperLightBattery.exe --list-devices   # list candidate Logitech HID interfaces
 SuperLightBattery.exe --probe          # test HID++ communication and battery feature
 SuperLightBattery.exe --once           # print a single JSON snapshot and exit
-SuperLightBattery.exe --tray           # run the tray app (default)
 ```
 
 `--once` example output:
@@ -103,31 +102,32 @@ The build writes:
 
 ```text
 out\SuperLightBattery.exe
+out\SuperLightBatteryLauncher.exe
 out\SuperLightBatteryInstaller.exe
 ```
 
-Both binaries are statically linked against the MSVC CRT (`/MT`), come in around 190 KB and 160 KB, and depend only on core Windows DLLs (`kernel32`, `user32`, `gdi32`, `shell32`, `setupapi`, `hid`, `advapi32`, `comctl32`). The icon is regenerated from `assets/generate-icon.ps1` if missing.
+The app and installer are statically linked against the MSVC CRT (`/MT`); the small startup launcher is CRT-free. The binaries depend only on core Windows DLLs (`kernel32`, `user32`, `gdi32`, `shell32`, `setupapi`, `hid`, `advapi32`, `comctl32`, `ole32`). The icon is regenerated from `assets/generate-icon.ps1` if missing.
 
 ## Troubleshooting
 
 **The tray icon shows "unavailable" and the menu has nothing useful.**
 Run `SuperLightBattery.exe --probe` from a terminal. It will list which Logitech HID collections are detected and which (if any) answer HID++. Make sure the receiver is plugged in and the mouse is paired and on.
 
-**A console window flashes when I run `SuperLightBattery.exe --tray` directly.**
-The tray binary is a console-subsystem app; the autostart entry hides the console by going through `SuperLightBatteryInstaller.exe --launch-tray`, which spawns the tray with `CREATE_NO_WINDOW`. For a console-free manual launch, use the installer or `--launch-tray`.
+**Why are there two app executables?**
+`SuperLightBattery.exe` is the real tray and CLI app. `SuperLightBatteryLauncher.exe` is the tiny windowless startup launcher shown by Startup Apps.
 
 **Icon looks blurry on a high-DPI display.**
 The tray icon renders at the shell's requested pixel size with 4× supersampling and is per-monitor DPI aware. If it still looks soft, open an issue and include your DPI scaling (Settings → System → Display → Scale).
 
-**Installer says "SuperLightBattery.exe must sit next to the installer."**
-The two executables need to be in the same folder. The release zip ships them that way already; re-download the full archive if they got separated.
+**Installer says a SuperLightBattery file must sit next to the installer.**
+The tray/CLI app, startup launcher, and installer need to be in the same folder. The release zip ships them that way already; re-download the full archive if they got separated.
 
 **Tray won't exit during uninstall.**
 The installer posts `WM_CLOSE` to the tray window and waits briefly. If the tray was unresponsive at that moment, exit it manually from its right-click menu and run uninstall again. The locked files were already scheduled for deletion at next reboot.
 
 ## Releases
 
-Tagged releases (`v*`) trigger a GitHub Actions build on `windows-latest` that zips both binaries plus the README and LICENSE and publishes a GitHub Release.
+Tagged releases (`v*`) trigger a GitHub Actions build on `windows-latest` that zips the binaries plus the README and LICENSE and publishes a GitHub Release.
 
 ```powershell
 git tag v1.0.0

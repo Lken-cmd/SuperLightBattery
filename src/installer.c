@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <strsafe.h>
 #include <commctrl.h>
 #include <wchar.h>
@@ -9,10 +10,14 @@
 #include "resource.h"
 
 #define APP_NAME L"SuperLightBattery"
-#define TOOL_EXE L"SuperLightBattery.exe"
+#define APP_EXE L"SuperLightBattery.exe"
+#define LAUNCHER_EXE L"SuperLightBatteryLauncher.exe"
 #define INSTALLER_EXE L"SuperLightBatteryInstaller.exe"
+#define STARTUP_SHORTCUT L"SuperLightBattery.lnk"
 #define TRAY_WINDOW_CLASS L"SuperLightBatteryTrayWindow"
 #define RUN_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define STARTUP_APPROVED_RUN_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
+#define STARTUP_APPROVED_FOLDER_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder"
 
 #define INSTALLER_CLASS_NAME L"SuperLightBatteryInstallerWindow"
 #define ID_BTN_INSTALL   1001
@@ -152,7 +157,11 @@ static BOOL CopyIfNeeded(const WCHAR *source, const WCHAR *destination)
 
 static void RequestTrayExit(void)
 {
-    HWND hwnd = FindWindowExW(HWND_MESSAGE, NULL, TRAY_WINDOW_CLASS, NULL);
+    HWND hwnd = FindWindowW(TRAY_WINDOW_CLASS, NULL);
+
+    if (!hwnd) {
+        hwnd = FindWindowExW(HWND_MESSAGE, NULL, TRAY_WINDOW_CLASS, NULL);
+    }
 
     if (hwnd) {
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -160,39 +169,77 @@ static void RequestTrayExit(void)
     }
 }
 
-static BOOL WriteRunKey(const WCHAR *installerPath)
+static BOOL GetStartupShortcutPath(WCHAR *path, size_t pathChars)
 {
-    HKEY key;
-    WCHAR command[MAX_PATH * 2];
-    LSTATUS status;
+    WCHAR startupDir[MAX_PATH];
 
-    if (FAILED(StringCchPrintfW(command, ARRAYSIZE(command), L"\"%s\" --launch-tray", installerPath))) {
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_STARTUP, NULL, SHGFP_TYPE_CURRENT, startupDir))) {
         return FALSE;
     }
 
-    status = RegCreateKeyExW(
-        HKEY_CURRENT_USER,
-        RUN_KEY_PATH,
-        0,
-        NULL,
-        REG_OPTION_NON_VOLATILE,
-        KEY_SET_VALUE,
-        NULL,
-        &key,
-        NULL);
-    if (status != ERROR_SUCCESS) {
+    return SUCCEEDED(StringCchPrintfW(path, pathChars, L"%s\\%s", startupDir, STARTUP_SHORTCUT));
+}
+
+static BOOL WriteStartupShortcut(const WCHAR *launcherPath, const WCHAR *installDir)
+{
+    WCHAR shortcutPath[MAX_PATH];
+    IShellLinkW *link = NULL;
+    IPersistFile *persist = NULL;
+    HRESULT hr;
+    BOOL ok = FALSE;
+
+    if (!GetStartupShortcutPath(shortcutPath, ARRAYSIZE(shortcutPath))) {
         return FALSE;
     }
 
-    status = RegSetValueExW(
-        key,
-        APP_NAME,
-        0,
-        REG_SZ,
-        (const BYTE *)command,
-        (DWORD)((wcslen(command) + 1) * sizeof(WCHAR)));
-    RegCloseKey(key);
-    return status == ERROR_SUCCESS;
+    hr = CoInitialize(NULL);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        return FALSE;
+    }
+
+    if (SUCCEEDED(CoCreateInstance(
+            &CLSID_ShellLink,
+            NULL,
+            CLSCTX_INPROC_SERVER,
+            &IID_IShellLinkW,
+            (void **)&link))) {
+        if (SUCCEEDED(link->lpVtbl->SetPath(link, launcherPath)) &&
+            SUCCEEDED(link->lpVtbl->SetWorkingDirectory(link, installDir)) &&
+            SUCCEEDED(link->lpVtbl->SetIconLocation(link, launcherPath, 0)) &&
+            SUCCEEDED(link->lpVtbl->SetShowCmd(link, SW_HIDE)) &&
+            SUCCEEDED(link->lpVtbl->QueryInterface(link, &IID_IPersistFile, (void **)&persist))) {
+            ok = SUCCEEDED(persist->lpVtbl->Save(persist, shortcutPath, TRUE));
+        }
+    }
+
+    if (persist) {
+        persist->lpVtbl->Release(persist);
+    }
+    if (link) {
+        link->lpVtbl->Release(link);
+    }
+    if (SUCCEEDED(hr)) {
+        CoUninitialize();
+    }
+
+    return ok;
+}
+
+static void DeleteStartupShortcut(void)
+{
+    WCHAR shortcutPath[MAX_PATH];
+
+    if (GetStartupShortcutPath(shortcutPath, ARRAYSIZE(shortcutPath))) {
+        (void)DeleteFileW(shortcutPath);
+    }
+}
+
+static BOOL StartupShortcutExists(void)
+{
+    WCHAR shortcutPath[MAX_PATH];
+
+    return GetStartupShortcutPath(shortcutPath, ARRAYSIZE(shortcutPath)) &&
+        GetFileAttributesW(shortcutPath) != INVALID_FILE_ATTRIBUTES;
 }
 
 static void DeleteRunKey(void)
@@ -205,41 +252,37 @@ static void DeleteRunKey(void)
     }
 }
 
-static BOOL IsInstalled(void)
+static void DeleteStartupApprovalValue(const WCHAR *keyPath, const WCHAR *valueName)
 {
     HKEY key;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, keyPath, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+        (void)RegDeleteValueW(key, valueName);
+        RegCloseKey(key);
+    }
+}
+
+static BOOL IsInstalled(void)
+{
     WCHAR installDir[MAX_PATH];
-    WCHAR destTool[MAX_PATH];
+    WCHAR destApp[MAX_PATH];
+    WCHAR destLauncher[MAX_PATH];
     WCHAR destInstaller[MAX_PATH];
-    WCHAR expectedCommand[MAX_PATH * 2];
-    WCHAR actualCommand[MAX_PATH * 2];
-    DWORD type = 0;
-    DWORD bytes = sizeof(actualCommand);
-    BOOL installed = FALSE;
 
     if (!GetInstallDirectory(installDir, ARRAYSIZE(installDir)) ||
-        FAILED(StringCchPrintfW(destTool, ARRAYSIZE(destTool), L"%s\\%s", installDir, TOOL_EXE)) ||
-        FAILED(StringCchPrintfW(destInstaller, ARRAYSIZE(destInstaller), L"%s\\%s", installDir, INSTALLER_EXE)) ||
-        FAILED(StringCchPrintfW(expectedCommand, ARRAYSIZE(expectedCommand), L"\"%s\" --launch-tray", destInstaller))) {
+        FAILED(StringCchPrintfW(destApp, ARRAYSIZE(destApp), L"%s\\%s", installDir, APP_EXE)) ||
+        FAILED(StringCchPrintfW(destLauncher, ARRAYSIZE(destLauncher), L"%s\\%s", installDir, LAUNCHER_EXE)) ||
+        FAILED(StringCchPrintfW(destInstaller, ARRAYSIZE(destInstaller), L"%s\\%s", installDir, INSTALLER_EXE))) {
         return FALSE;
     }
 
-    if (GetFileAttributesW(destTool) == INVALID_FILE_ATTRIBUTES ||
+    if (GetFileAttributesW(destApp) == INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW(destLauncher) == INVALID_FILE_ATTRIBUTES ||
         GetFileAttributesW(destInstaller) == INVALID_FILE_ATTRIBUTES) {
         return FALSE;
     }
 
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY_PATH, 0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
-        ZeroMemory(actualCommand, sizeof(actualCommand));
-        if (RegQueryValueExW(key, APP_NAME, NULL, &type, (BYTE *)actualCommand, &bytes) == ERROR_SUCCESS &&
-            (type == REG_SZ || type == REG_EXPAND_SZ)) {
-            actualCommand[ARRAYSIZE(actualCommand) - 1] = L'\0';
-            installed = SamePathNoCase(actualCommand, expectedCommand);
-        }
-        RegCloseKey(key);
-    }
-
-    return installed;
+    return StartupShortcutExists();
 }
 
 static BOOL LaunchTrayFromDirectory(const WCHAR *dir)
@@ -250,7 +293,7 @@ static BOOL LaunchTrayFromDirectory(const WCHAR *dir)
     PROCESS_INFORMATION process;
     BOOL ok;
 
-    if (FAILED(StringCchPrintfW(toolPath, ARRAYSIZE(toolPath), L"%s\\%s", dir, TOOL_EXE)) ||
+    if (FAILED(StringCchPrintfW(toolPath, ARRAYSIZE(toolPath), L"%s\\%s", dir, APP_EXE)) ||
         FAILED(StringCchPrintfW(command, ARRAYSIZE(command), L"\"%s\" --tray", toolPath))) {
         return FALSE;
     }
@@ -284,10 +327,12 @@ static BOOL LaunchTrayFromDirectory(const WCHAR *dir)
 static BOOL DoInstall(WCHAR *errorMessage, size_t errorMessageChars, BOOL *trayStarted)
 {
     WCHAR sourceDir[MAX_PATH];
-    WCHAR sourceTool[MAX_PATH];
+    WCHAR sourceApp[MAX_PATH];
+    WCHAR sourceLauncher[MAX_PATH];
     WCHAR sourceInstaller[MAX_PATH];
     WCHAR installDir[MAX_PATH];
-    WCHAR destTool[MAX_PATH];
+    WCHAR destApp[MAX_PATH];
+    WCHAR destLauncher[MAX_PATH];
     WCHAR destInstaller[MAX_PATH];
 
     if (errorMessage && errorMessageChars > 0) {
@@ -299,9 +344,11 @@ static BOOL DoInstall(WCHAR *errorMessage, size_t errorMessageChars, BOOL *trayS
 
     if (!GetModuleDirectory(sourceDir, ARRAYSIZE(sourceDir)) ||
         !GetInstallDirectory(installDir, ARRAYSIZE(installDir)) ||
-        FAILED(StringCchPrintfW(sourceTool, ARRAYSIZE(sourceTool), L"%s\\%s", sourceDir, TOOL_EXE)) ||
+        FAILED(StringCchPrintfW(sourceApp, ARRAYSIZE(sourceApp), L"%s\\%s", sourceDir, APP_EXE)) ||
+        FAILED(StringCchPrintfW(sourceLauncher, ARRAYSIZE(sourceLauncher), L"%s\\%s", sourceDir, LAUNCHER_EXE)) ||
         FAILED(StringCchPrintfW(sourceInstaller, ARRAYSIZE(sourceInstaller), L"%s\\%s", sourceDir, INSTALLER_EXE)) ||
-        FAILED(StringCchPrintfW(destTool, ARRAYSIZE(destTool), L"%s\\%s", installDir, TOOL_EXE)) ||
+        FAILED(StringCchPrintfW(destApp, ARRAYSIZE(destApp), L"%s\\%s", installDir, APP_EXE)) ||
+        FAILED(StringCchPrintfW(destLauncher, ARRAYSIZE(destLauncher), L"%s\\%s", installDir, LAUNCHER_EXE)) ||
         FAILED(StringCchPrintfW(destInstaller, ARRAYSIZE(destInstaller), L"%s\\%s", installDir, INSTALLER_EXE))) {
         if (errorMessage) {
             (void)StringCchCopyW(errorMessage, errorMessageChars, L"Could not prepare install paths.");
@@ -309,9 +356,15 @@ static BOOL DoInstall(WCHAR *errorMessage, size_t errorMessageChars, BOOL *trayS
         return FALSE;
     }
 
-    if (GetFileAttributesW(sourceTool) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributesW(sourceApp) == INVALID_FILE_ATTRIBUTES) {
         if (errorMessage) {
             (void)StringCchCopyW(errorMessage, errorMessageChars, L"SuperLightBattery.exe must sit next to the installer.");
+        }
+        return FALSE;
+    }
+    if (GetFileAttributesW(sourceLauncher) == INVALID_FILE_ATTRIBUTES) {
+        if (errorMessage) {
+            (void)StringCchCopyW(errorMessage, errorMessageChars, L"SuperLightBatteryLauncher.exe must sit next to the installer.");
         }
         return FALSE;
     }
@@ -325,14 +378,20 @@ static BOOL DoInstall(WCHAR *errorMessage, size_t errorMessageChars, BOOL *trayS
 
     RequestTrayExit();
 
-    if (!CopyIfNeeded(sourceTool, destTool) || !CopyIfNeeded(sourceInstaller, destInstaller)) {
+    if (!CopyIfNeeded(sourceApp, destApp) ||
+        !CopyIfNeeded(sourceLauncher, destLauncher) ||
+        !CopyIfNeeded(sourceInstaller, destInstaller)) {
         if (errorMessage) {
             (void)StringCchCopyW(errorMessage, errorMessageChars, L"Could not copy SuperLightBattery files.");
         }
         return FALSE;
     }
 
-    if (!WriteRunKey(destInstaller)) {
+    DeleteRunKey();
+    DeleteStartupApprovalValue(STARTUP_APPROVED_RUN_KEY_PATH, APP_NAME);
+    DeleteStartupShortcut();
+
+    if (!WriteStartupShortcut(destLauncher, installDir)) {
         if (errorMessage) {
             (void)StringCchCopyW(errorMessage, errorMessageChars, L"Could not register the startup entry.");
         }
@@ -351,7 +410,8 @@ static BOOL DoInstall(WCHAR *errorMessage, size_t errorMessageChars, BOOL *trayS
 static BOOL DoUninstall(WCHAR *errorMessage, size_t errorMessageChars)
 {
     WCHAR installDir[MAX_PATH];
-    WCHAR destTool[MAX_PATH];
+    WCHAR destApp[MAX_PATH];
+    WCHAR destLauncher[MAX_PATH];
     WCHAR destInstaller[MAX_PATH];
 
     if (errorMessage && errorMessageChars > 0) {
@@ -359,10 +419,14 @@ static BOOL DoUninstall(WCHAR *errorMessage, size_t errorMessageChars)
     }
 
     DeleteRunKey();
+    DeleteStartupApprovalValue(STARTUP_APPROVED_RUN_KEY_PATH, APP_NAME);
+    DeleteStartupApprovalValue(STARTUP_APPROVED_FOLDER_KEY_PATH, STARTUP_SHORTCUT);
+    DeleteStartupShortcut();
     RequestTrayExit();
 
     if (!GetInstallDirectory(installDir, ARRAYSIZE(installDir)) ||
-        FAILED(StringCchPrintfW(destTool, ARRAYSIZE(destTool), L"%s\\%s", installDir, TOOL_EXE)) ||
+        FAILED(StringCchPrintfW(destApp, ARRAYSIZE(destApp), L"%s\\%s", installDir, APP_EXE)) ||
+        FAILED(StringCchPrintfW(destLauncher, ARRAYSIZE(destLauncher), L"%s\\%s", installDir, LAUNCHER_EXE)) ||
         FAILED(StringCchPrintfW(destInstaller, ARRAYSIZE(destInstaller), L"%s\\%s", installDir, INSTALLER_EXE))) {
         if (errorMessage) {
             (void)StringCchCopyW(errorMessage, errorMessageChars, L"Could not prepare uninstall paths.");
@@ -370,8 +434,11 @@ static BOOL DoUninstall(WCHAR *errorMessage, size_t errorMessageChars)
         return FALSE;
     }
 
-    if (!DeleteFileW(destTool) && GetLastError() != ERROR_FILE_NOT_FOUND) {
-        (void)MoveFileExW(destTool, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    if (!DeleteFileW(destApp) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        (void)MoveFileExW(destApp, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+    if (!DeleteFileW(destLauncher) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        (void)MoveFileExW(destLauncher, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
     }
     if (!DeleteFileW(destInstaller) && GetLastError() != ERROR_FILE_NOT_FOUND) {
         (void)MoveFileExW(destInstaller, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
@@ -410,17 +477,6 @@ static int CliUninstall(void)
     }
     MessageBoxW(NULL, error[0] ? error : L"Uninstall failed.", APP_NAME, MB_OK | MB_ICONERROR);
     return 1;
-}
-
-static int LaunchTray(void)
-{
-    WCHAR dir[MAX_PATH];
-
-    if (!GetModuleDirectory(dir, ARRAYSIZE(dir))) {
-        return 1;
-    }
-
-    return LaunchTrayFromDirectory(dir) ? 0 : 1;
 }
 
 static void ShowUsage(void)
@@ -803,8 +859,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previousInstance, PWSTR comman
         result = CliInstall();
     } else if (wcscmp(argv[1], L"--uninstall") == 0) {
         result = CliUninstall();
-    } else if (wcscmp(argv[1], L"--launch-tray") == 0) {
-        result = LaunchTray();
     } else if (wcscmp(argv[1], L"--gui") == 0) {
         result = RunInstallerGui(instance);
     } else if (wcscmp(argv[1], L"--help") == 0 || wcscmp(argv[1], L"-h") == 0 || wcscmp(argv[1], L"/?") == 0) {

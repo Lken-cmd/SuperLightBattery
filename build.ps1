@@ -12,11 +12,17 @@ $IconGenerator = Join-Path $AssetsDir "generate-icon.ps1"
 $InstallerIconPath = Join-Path $AssetsDir "SuperLightBatteryInstaller.ico"
 $InstallerIconGenerator = Join-Path $AssetsDir "generate-installer-icon.ps1"
 
-$ToolSource = Join-Path $Root "src\superlightbattery.c"
-$ToolRc = Join-Path $Root "src\app.rc"
-$ToolRes = Join-Path $OutDir "app.res"
-$ToolExe = Join-Path $OutDir "SuperLightBattery.exe"
-$ToolObj = Join-Path $OutDir "superlightbattery.obj"
+$AppSource = Join-Path $Root "src\superlightbattery.c"
+$AppRc = Join-Path $Root "src\app.rc"
+$AppRes = Join-Path $OutDir "app.res"
+$AppExe = Join-Path $OutDir "SuperLightBattery.exe"
+$AppObj = Join-Path $OutDir "superlightbattery.obj"
+
+$LauncherSource = Join-Path $Root "src\launcher.c"
+$LauncherRc = Join-Path $Root "src\launcher.rc"
+$LauncherRes = Join-Path $OutDir "launcher.res"
+$LauncherExe = Join-Path $OutDir "SuperLightBatteryLauncher.exe"
+$LauncherObj = Join-Path $OutDir "launcher.obj"
 
 $InstallerSource = Join-Path $Root "src\installer.c"
 $InstallerRc = Join-Path $Root "src\installer.rc"
@@ -91,7 +97,10 @@ function New-ClArgs {
         [string]$Obj,
         [string]$Res,
         [string[]]$Libs,
-        [string[]]$LinkArgs = @()
+        [string[]]$CompileArgs = @(),
+        [string[]]$LinkArgs = @(),
+        [switch]$NoGl,
+        [switch]$NoLtcg
     )
 
     $args = @(
@@ -99,12 +108,18 @@ function New-ClArgs {
         "/std:c11",
         "/W4",
         "/O1",
-        "/GL",
         "/Gw",
         "/Gy",
         "/MT",
         "/DUNICODE",
-        "/D_UNICODE",
+        "/D_UNICODE"
+    )
+
+    if (-not $NoGl) {
+        $args += "/GL"
+    }
+    $args += $CompileArgs
+    $args += @(
         "/Fo:`"$Obj`"",
         "/Fe:`"$Exe`"",
         "`"$Source`"",
@@ -114,20 +129,36 @@ function New-ClArgs {
     )
 
     $args += $LinkArgs
-    $args += @("/LTCG", "/OPT:REF", "/OPT:ICF", "/INCREMENTAL:NO")
+    if (-not $NoLtcg) {
+        $args += "/LTCG"
+    }
+    $args += @("/OPT:REF", "/OPT:ICF", "/INCREMENTAL:NO")
     $args += $Libs
     return ($args -join " ")
 }
 
-$toolRcArgs = New-RcArgs -Source $ToolRc -Output $ToolRes
+$appRcArgs = New-RcArgs -Source $AppRc -Output $AppRes
+$launcherRcArgs = New-RcArgs -Source $LauncherRc -Output $LauncherRes
 $installerRcArgs = New-RcArgs -Source $InstallerRc -Output $InstallerRes
 
-$toolArgs = New-ClArgs `
-    -Source $ToolSource `
-    -Exe $ToolExe `
-    -Obj $ToolObj `
-    -Res $ToolRes `
+$appArgs = New-ClArgs `
+    -Source $AppSource `
+    -Exe $AppExe `
+    -Obj $AppObj `
+    -Res $AppRes `
+    -LinkArgs @("/SUBSYSTEM:CONSOLE") `
     -Libs @("setupapi.lib", "hid.lib", "shell32.lib", "user32.lib", "gdi32.lib")
+
+$launcherArgs = New-ClArgs `
+    -Source $LauncherSource `
+    -Exe $LauncherExe `
+    -Obj $LauncherObj `
+    -Res $LauncherRes `
+    -CompileArgs @("/GS-") `
+    -LinkArgs @("/SUBSYSTEM:WINDOWS", "/ENTRY:LauncherEntry", "/NODEFAULTLIB") `
+    -NoGl `
+    -NoLtcg `
+    -Libs @("kernel32.lib", "user32.lib")
 
 $installerArgs = New-ClArgs `
     -Source $InstallerSource `
@@ -135,13 +166,14 @@ $installerArgs = New-ClArgs `
     -Obj $InstallerObj `
     -Res $InstallerRes `
     -LinkArgs @("/SUBSYSTEM:WINDOWS") `
-    -Libs @("shell32.lib", "user32.lib", "advapi32.lib", "gdi32.lib", "comctl32.lib")
+    -Libs @("shell32.lib", "ole32.lib", "uuid.lib", "user32.lib", "advapi32.lib", "gdi32.lib", "comctl32.lib")
 
-$cmd = "`"$vsdevcmd`" -arch=x64 -host_arch=x64 >NUL 2>NUL && rc $toolRcArgs && rc $installerRcArgs && cl $toolArgs && cl $installerArgs"
+$cmd = "`"$vsdevcmd`" -arch=x64 -host_arch=x64 >NUL 2>NUL && rc $appRcArgs && rc $launcherRcArgs && rc $installerRcArgs && cl $appArgs && cl $launcherArgs && cl $installerArgs"
 cmd.exe /d /s /c $cmd
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
 Write-Host "Built out\SuperLightBattery.exe"
+Write-Host "Built out\SuperLightBatteryLauncher.exe"
 Write-Host "Built out\SuperLightBatteryInstaller.exe"

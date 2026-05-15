@@ -1700,9 +1700,13 @@ static HICON g_trayIcon = NULL;
 static int g_trayIconPercent = -2;
 static BOOL g_trayIconCharging = FALSE;
 static int g_trayIconSize = 0;
+static BOOL g_trayIconAdded = FALSE;
+static UINT g_taskbarCreatedMessage = 0;
 static ULONGLONG g_lastHoverRefreshTick = 0;
 static volatile LONG g_refreshInProgress = 0;
 static HDEVNOTIFY g_hidDeviceNotify = NULL;
+
+static void AddTrayIcon(HWND hwnd);
 
 static DWORD Argb(BYTE a, BYTE r, BYTE g, BYTE b)
 {
@@ -2123,6 +2127,11 @@ static void UpdateTrayTip(HWND hwnd)
     int iconSize = GetTrayIconSize(hwnd);
     BOOL iconChanged;
 
+    if (!g_trayIconAdded) {
+        AddTrayIcon(hwnd);
+        return;
+    }
+
     DescribeTrayTip(tip, ARRAY_LEN(tip));
 
     if (g_traySnapshotValid) {
@@ -2154,7 +2163,9 @@ static void UpdateTrayTip(HWND hwnd)
     g_tray.uCallbackMessage = WM_TRAYICON;
     g_tray.hIcon = g_trayIcon ? g_trayIcon : LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APPICON));
     (void)StringCchCopyW(g_tray.szTip, ARRAY_LEN(g_tray.szTip), tip);
-    (void)Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+    if (!Shell_NotifyIconW(NIM_MODIFY, &g_tray)) {
+        g_trayIconAdded = FALSE;
+    }
     if (iconChanged && oldIcon) {
         DestroyIcon(oldIcon);
     }
@@ -2201,11 +2212,12 @@ static void RequestTrayBatteryRefreshForHover(HWND hwnd)
 static void AddTrayIcon(HWND hwnd)
 {
     WCHAR tip[128];
+    HICON oldIcon = g_trayIcon;
     int iconSize = GetTrayIconSize(hwnd);
 
     g_trayIcon = CreateBatteryTrayIcon(iconSize);
     g_trayIconSize = iconSize;
-    (void)StringCchCopyW(tip, ARRAY_LEN(tip), L"SuperLightBattery: starting");
+    DescribeTrayTip(tip, ARRAY_LEN(tip));
 
     ZeroMemory(&g_tray, sizeof(g_tray));
     g_tray.cbSize = sizeof(g_tray);
@@ -2216,8 +2228,15 @@ static void AddTrayIcon(HWND hwnd)
     g_tray.hIcon = g_trayIcon ? g_trayIcon : LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APPICON));
     (void)StringCchCopyW(g_tray.szTip, ARRAY_LEN(g_tray.szTip), tip);
     if (Shell_NotifyIconW(NIM_ADD, &g_tray)) {
+        g_trayIconAdded = TRUE;
         g_tray.uVersion = NOTIFYICON_VERSION_4;
         (void)Shell_NotifyIconW(NIM_SETVERSION, &g_tray);
+    } else {
+        g_trayIconAdded = FALSE;
+    }
+
+    if (oldIcon) {
+        DestroyIcon(oldIcon);
     }
 }
 
@@ -2226,6 +2245,7 @@ static void RemoveTrayIcon(void)
     if (g_tray.cbSize != 0) {
         (void)Shell_NotifyIconW(NIM_DELETE, &g_tray);
     }
+    g_trayIconAdded = FALSE;
     if (g_trayIcon) {
         DestroyIcon(g_trayIcon);
         g_trayIcon = NULL;
@@ -2316,6 +2336,12 @@ static void ShowTrayMenu(HWND hwnd)
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if (g_taskbarCreatedMessage != 0 && msg == g_taskbarCreatedMessage) {
+        g_trayIconAdded = FALSE;
+        AddTrayIcon(hwnd);
+        return 0;
+    }
+
     switch (msg) {
     case WM_CREATE:
         AddTrayIcon(hwnd);
@@ -2417,6 +2443,7 @@ static int RunTray(HINSTANCE instance)
     }
 
     EnablePerMonitorDpiAwareness();
+    g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = TrayWndProc;
@@ -2439,7 +2466,7 @@ static int RunTray(HINSTANCE instance)
         0,
         0,
         0,
-        HWND_MESSAGE,
+        NULL,
         NULL,
         instance,
         NULL);
@@ -2459,7 +2486,7 @@ static int RunTray(HINSTANCE instance)
     return 0;
 }
 
-int wmain(int argc, WCHAR **argv)
+static int RunApp(int argc, WCHAR **argv)
 {
     HINSTANCE instance = GetModuleHandleW(NULL);
     int result;
@@ -2500,4 +2527,9 @@ int wmain(int argc, WCHAR **argv)
     result = RunTray(instance);
     CloseHidQueryLockHandle();
     return result;
+}
+
+int wmain(int argc, WCHAR **argv)
+{
+    return RunApp(argc, argv);
 }

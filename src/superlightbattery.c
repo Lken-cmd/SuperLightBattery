@@ -1708,149 +1708,97 @@ static HDEVNOTIFY g_hidDeviceNotify = NULL;
 
 static void AddTrayIcon(HWND hwnd);
 
-static DWORD Argb(BYTE a, BYTE r, BYTE g, BYTE b)
+typedef struct IconPixel {
+    BYTE r;
+    BYTE g;
+    BYTE b;
+    BYTE a;
+} IconPixel;
+
+static const IconPixel ICON_CLEAR = {0, 0, 0, 0};
+static const IconPixel ICON_INK = {14, 15, 18, 255};
+static const IconPixel ICON_EMPTY = {245, 246, 248, 255};
+static const IconPixel ICON_UNKNOWN = {165, 174, 185, 255};
+static const IconPixel ICON_HIGH = {31, 191, 107, 255};
+static const IconPixel ICON_MID = {231, 178, 58, 255};
+static const IconPixel ICON_LOW = {226, 90, 58, 255};
+
+static DWORD PremultipliedArgb(IconPixel pixel)
 {
-    return ((DWORD)a << 24) | ((DWORD)r << 16) | ((DWORD)g << 8) | b;
+    BYTE b = (BYTE)((pixel.b * pixel.a + 127) / 255);
+    BYTE g = (BYTE)((pixel.g * pixel.a + 127) / 255);
+    BYTE r = (BYTE)((pixel.r * pixel.a + 127) / 255);
+
+    return ((DWORD)pixel.a << 24) | ((DWORD)r << 16) | ((DWORD)g << 8) | b;
 }
 
-static BOOL PointInRoundedRect(int x, int y, int left, int top, int right, int bottom, int radius)
+static IconPixel BatteryLevelColor(int percent)
 {
-    int cx = x;
-    int cy = y;
-    int dx;
-    int dy;
-
-    if (x < left || x > right || y < top || y > bottom) {
-        return FALSE;
+    if (percent >= 60) {
+        return ICON_HIGH;
     }
-
-    if (cx < left + radius) {
-        cx = left + radius;
-    } else if (cx > right - radius) {
-        cx = right - radius;
+    if (percent >= 25) {
+        return ICON_MID;
     }
-
-    if (cy < top + radius) {
-        cy = top + radius;
-    } else if (cy > bottom - radius) {
-        cy = bottom - radius;
-    }
-
-    dx = x - cx;
-    dy = y - cy;
-    return dx * dx + dy * dy <= radius * radius;
+    return ICON_LOW;
 }
 
-static void DrawRoundedRect(DWORD *pixels, int width, int height, int left, int top, int right, int bottom, int radius, DWORD color)
+static void FillIconRect16(IconPixel pixels[16 * 16], int left, int top, int width, int height, IconPixel color)
 {
-    for (int y = top; y <= bottom; ++y) {
-        if (y < 0 || y >= height) {
+    for (int y = top; y < top + height; ++y) {
+        if (y < 0 || y >= 16) {
             continue;
         }
 
-        for (int x = left; x <= right; ++x) {
-            if (x < 0 || x >= width) {
+        for (int x = left; x < left + width; ++x) {
+            if (x < 0 || x >= 16) {
                 continue;
             }
 
-            if (PointInRoundedRect(x, y, left, top, right, bottom, radius)) {
-                pixels[(size_t)y * width + x] = color;
-            }
+            pixels[y * 16 + x] = color;
         }
     }
 }
 
-static BOOL PointInPolygon(int x, int y, const POINT *points, int pointCount)
+static void RenderBatteryIcon16(IconPixel pixels[16 * 16], int percent, BOOL charging)
 {
-    BOOL inside = FALSE;
-
-    for (int i = 0, j = pointCount - 1; i < pointCount; j = i++) {
-        if (((points[i].y > y) != (points[j].y > y)) &&
-            (x < (points[j].x - points[i].x) * (y - points[i].y) / (points[j].y - points[i].y) + points[i].x)) {
-            inside = !inside;
-        }
+    for (int i = 0; i < 16 * 16; ++i) {
+        pixels[i] = ICON_CLEAR;
     }
 
-    return inside;
-}
+    FillIconRect16(pixels, 6, 1, 4, 1, ICON_INK);
+    FillIconRect16(pixels, 3, 2, 10, 13, ICON_INK);
+    FillIconRect16(pixels, 4, 3, 8, 11, ICON_EMPTY);
 
-static void DrawPolygon(DWORD *pixels, int width, int height, const POINT *points, int pointCount, int dx, int dy, DWORD color)
-{
-    POINT moved[8];
-    int left;
-    int right;
-    int top;
-    int bottom;
+    if (charging) {
+        FillIconRect16(pixels, 4, 3, 8, 11, ICON_HIGH);
+        FillIconRect16(pixels, 8, 4, 2, 1, ICON_INK);
+        FillIconRect16(pixels, 7, 5, 2, 1, ICON_INK);
+        FillIconRect16(pixels, 7, 6, 1, 1, ICON_INK);
+        FillIconRect16(pixels, 6, 7, 4, 1, ICON_INK);
+        FillIconRect16(pixels, 8, 8, 1, 1, ICON_INK);
+        FillIconRect16(pixels, 7, 9, 1, 1, ICON_INK);
+        FillIconRect16(pixels, 7, 10, 1, 1, ICON_INK);
+        FillIconRect16(pixels, 6, 11, 1, 1, ICON_INK);
+    } else if (percent >= 0) {
+        int fillHeight = (percent * 11 + 50) / 100;
 
-    if (pointCount <= 0 || pointCount > (int)ARRAY_LEN(moved)) {
-        return;
-    }
-
-    for (int i = 0; i < pointCount; ++i) {
-        moved[i].x = points[i].x + dx;
-        moved[i].y = points[i].y + dy;
-    }
-
-    left = right = moved[0].x;
-    top = bottom = moved[0].y;
-    for (int i = 1; i < pointCount; ++i) {
-        if (moved[i].x < left) {
-            left = moved[i].x;
+        if (fillHeight > 11) {
+            fillHeight = 11;
         }
-        if (moved[i].x > right) {
-            right = moved[i].x;
+        if (percent > 0 && fillHeight < 1) {
+            fillHeight = 1;
         }
-        if (moved[i].y < top) {
-            top = moved[i].y;
+        if (fillHeight > 0) {
+            FillIconRect16(pixels, 4, 14 - fillHeight, 8, fillHeight, BatteryLevelColor(percent));
         }
-        if (moved[i].y > bottom) {
-            bottom = moved[i].y;
-        }
+    } else {
+        FillIconRect16(pixels, 4, 3, 8, 11, ICON_UNKNOWN);
     }
-
-    for (int y = top; y <= bottom; ++y) {
-        if (y < 0 || y >= height) {
-            continue;
-        }
-
-        for (int x = left; x <= right; ++x) {
-            if (x < 0 || x >= width) {
-                continue;
-            }
-
-            if (PointInPolygon(x, y, moved, pointCount)) {
-                pixels[(size_t)y * width + x] = color;
-            }
-        }
-    }
-}
-
-static void DrawChargingBolt(DWORD *pixels, int hi)
-{
-    static const POINT bolt[] = {
-        {37, 14}, {25, 36}, {34, 35}, {29, 53}, {46, 28}, {37, 30}
-    };
-    POINT scaled[ARRAY_LEN(bolt)];
-    int shadow = (2 * hi + 32) / 64;
-
-    if (shadow < 1) {
-        shadow = 1;
-    }
-
-    for (int i = 0; i < (int)ARRAY_LEN(bolt); ++i) {
-        scaled[i].x = (bolt[i].x * hi + 32) / 64;
-        scaled[i].y = (bolt[i].y * hi + 32) / 64;
-    }
-
-    DrawPolygon(pixels, hi, hi, scaled, (int)ARRAY_LEN(scaled), shadow, shadow, Argb(150, 0, 0, 0));
-    DrawPolygon(pixels, hi, hi, scaled, (int)ARRAY_LEN(scaled), 0, 0, Argb(255, 255, 211, 75));
 }
 
 static HICON CreateBatteryTrayIcon(int targetSize)
 {
-    enum { SUPERSAMPLE = 4 };
-    int hi;
-    int samples = SUPERSAMPLE * SUPERSAMPLE;
     BITMAPINFO bmi;
     void *bits = NULL;
     HDC screenDc = NULL;
@@ -1858,22 +1806,17 @@ static HICON CreateBatteryTrayIcon(int targetSize)
     HBITMAP maskBitmap = NULL;
     HICON icon = NULL;
     ICONINFO iconInfo;
-    DWORD *highPixels = NULL;
     BYTE *maskBits = NULL;
-    DWORD *pixels;
+    DWORD *targetPixels;
     int maskRowBytes;
     int percent = -1;
     BOOL charging = FALSE;
-    DWORD shell = Argb(255, 22, 27, 34);
-    DWORD surface = Argb(255, 245, 247, 250);
-    DWORD empty = Argb(255, 165, 174, 185);
-    DWORD fill = Argb(255, 32, 201, 117);
+    IconPixel sourcePixels[16 * 16];
 
     if (targetSize <= 0 || targetSize > 256) {
         return NULL;
     }
 
-    hi = targetSize * SUPERSAMPLE;
     maskRowBytes = ((targetSize + 31) / 32) * 4;
 
     if (g_traySnapshotValid) {
@@ -1883,59 +1826,12 @@ static HICON CreateBatteryTrayIcon(int targetSize)
         }
     }
 
-    if (percent >= 0 && percent <= 20) {
-        fill = Argb(255, 238, 76, 76);
-    } else if (percent >= 0 && percent <= 50) {
-        fill = Argb(255, 245, 183, 66);
-    }
-
-    highPixels = (DWORD *)calloc((size_t)hi * (size_t)hi, sizeof(DWORD));
     maskBits = (BYTE *)calloc((size_t)maskRowBytes * (size_t)targetSize, 1);
-    if (!highPixels || !maskBits) {
-        free(highPixels);
-        free(maskBits);
+    if (!maskBits) {
         return NULL;
     }
 
-#define DSX(v) (((v) * hi + 32) / 64)
-
-    DrawRoundedRect(highPixels, hi, hi, DSX(10), DSX(8), DSX(58), DSX(63), DSX(10), Argb(90, 0, 0, 0));
-    DrawRoundedRect(highPixels, hi, hi, DSX(22), DSX(0), DSX(42), DSX(10), DSX(4), shell);
-    DrawRoundedRect(highPixels, hi, hi, DSX(8), DSX(5), DSX(56), DSX(63), DSX(10), shell);
-    DrawRoundedRect(highPixels, hi, hi, DSX(15), DSX(12), DSX(49), DSX(57), DSX(7), surface);
-
-    {
-        int fillLeft = DSX(19);
-        int fillRight = DSX(45);
-        int fillTop = DSX(16);
-        int fillBottom = DSX(53);
-        int radius = DSX(5);
-
-        if (percent >= 0) {
-            int height = ((fillBottom - fillTop + 1) * percent + 99) / 100;
-            int visibleTop = fillBottom - height + 1;
-
-            if (percent > 0 && visibleTop > fillBottom) {
-                visibleTop = fillBottom;
-            }
-
-            for (int y = fillTop; y <= fillBottom; ++y) {
-                for (int x = fillLeft; x <= fillRight; ++x) {
-                    if (y >= visibleTop && PointInRoundedRect(x, y, fillLeft, fillTop, fillRight, fillBottom, radius)) {
-                        highPixels[(size_t)y * hi + x] = fill;
-                    }
-                }
-            }
-        } else {
-            DrawRoundedRect(highPixels, hi, hi, fillLeft, fillTop, fillRight, fillBottom, radius, empty);
-        }
-    }
-
-#undef DSX
-
-    if (charging) {
-        DrawChargingBolt(highPixels, hi);
-    }
+    RenderBatteryIcon16(sourcePixels, percent, charging);
 
     ZeroMemory(&bmi, sizeof(bmi));
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -1947,7 +1843,6 @@ static HICON CreateBatteryTrayIcon(int targetSize)
 
     screenDc = GetDC(NULL);
     if (!screenDc) {
-        free(highPixels);
         free(maskBits);
         return NULL;
     }
@@ -1958,45 +1853,22 @@ static HICON CreateBatteryTrayIcon(int targetSize)
         if (colorBitmap) {
             DeleteObject(colorBitmap);
         }
-        free(highPixels);
         free(maskBits);
         return NULL;
     }
 
-    pixels = (DWORD *)bits;
-    ZeroMemory(pixels, (size_t)targetSize * (size_t)targetSize * sizeof(DWORD));
-
+    targetPixels = (DWORD *)bits;
     for (int y = 0; y < targetSize; ++y) {
+        int sourceY = (y * 16) / targetSize;
+
         for (int x = 0; x < targetSize; ++x) {
-            unsigned int a = 0;
-            unsigned int r = 0;
-            unsigned int g = 0;
-            unsigned int b = 0;
+            int sourceX = (x * 16) / targetSize;
 
-            for (int sy = 0; sy < SUPERSAMPLE; ++sy) {
-                for (int sx = 0; sx < SUPERSAMPLE; ++sx) {
-                    DWORD c = highPixels[(size_t)(y * SUPERSAMPLE + sy) * hi + (x * SUPERSAMPLE + sx)];
-                    BYTE ca = (BYTE)((c >> 24) & 0xFF);
-
-                    a += ca;
-                    r += ((c >> 16) & 0xFF) * ca;
-                    g += ((c >> 8) & 0xFF) * ca;
-                    b += (c & 0xFF) * ca;
-                }
-            }
-
-            if (a > 0) {
-                r /= a;
-                g /= a;
-                b /= a;
-                a /= samples;
-                pixels[(size_t)y * targetSize + x] = Argb((BYTE)a, (BYTE)r, (BYTE)g, (BYTE)b);
-            }
+            targetPixels[(size_t)y * targetSize + x] = PremultipliedArgb(sourcePixels[sourceY * 16 + sourceX]);
         }
     }
 
     maskBitmap = CreateBitmap(targetSize, targetSize, 1, 1, maskBits);
-    free(highPixels);
     free(maskBits);
     if (!maskBitmap) {
         DeleteObject(colorBitmap);

@@ -1,8 +1,14 @@
 # SuperLightBattery
 
-A tiny Windows battery indicator for Logitech LIGHTSPEED mice — no G HUB, no service, no telemetry.
+A tiny Windows battery indicator for the Logitech PRO X Superlight, no G HUB, no service, no telemetry.
 
-SuperLightBattery shows the battery level of a Logitech LIGHTSPEED mouse (PRO X Superlight family and similar HID++ 2.0 devices) in the system tray. Small native binaries, statically linked, no background framework. Tested on Windows 11.
+SuperLightBattery shows the battery level of an original Logitech PRO X Superlight in the system tray. Small native binaries, statically linked, no background framework. Tested on Windows 11.
+
+## Compatibility
+
+Tested with the original Logitech PRO X Superlight.
+
+Other Logitech LIGHTSPEED / HID++ mice, including the PRO X Superlight 2, may or may not work. Reports are welcome.
 
 ## Install
 
@@ -18,7 +24,7 @@ No admin rights are required. Files go to `%LOCALAPPDATA%\SuperLightBattery` and
 The tray icon shows battery state as a vertical fill on a battery silhouette.
 
 - **Green** above 50 %, **amber** 21–50 %, **red** at 20 % and below.
-- A yellow lightning bolt overlay means the mouse reports it is charging.
+- A black lightning bolt overlay means the mouse reports it is charging.
 - An empty grey bar means the percent is unknown (voltage-only firmware, coarse state, or no device).
 
 | Action on the icon | What happens |
@@ -39,7 +45,7 @@ Run the installer again and click **Uninstall**, or:
 SuperLightBatteryInstaller.exe --uninstall
 ```
 
-This deletes the files, removes the startup shortcut, cleans up any old registry startup entry, and stops the running tray. If a file is locked because the tray is still active, the installer schedules it for deletion at next reboot.
+This deletes the files, removes the startup shortcut and stops the running tray.
 
 ## CLI
 
@@ -83,12 +89,10 @@ SuperLightBattery.exe --once           # print a single JSON snapshot and exit
 
 Notes:
 
-- `battery.percent` is firmware-reported when available. Voltage is never converted into a fake percentage.
+- `battery.percent` is firmware-reported.
 - `battery.source` names the HID++ feature or register that supplied the value.
 - `device.name` is the firmware-reported name; `device.hid_product` is the generic Windows HID product string.
 - Unsupported sections come back as `null`.
-
-`--list-devices` and `--probe` deliberately do not print serial numbers, USB instance IDs, HID device paths, captures, or logs.
 
 ## Build from source
 
@@ -107,23 +111,6 @@ out\SuperLightBatteryInstaller.exe
 ```
 
 The app and installer are statically linked against the MSVC CRT (`/MT`); the small startup launcher is CRT-free. The binaries depend only on core Windows DLLs (`kernel32`, `user32`, `gdi32`, `shell32`, `setupapi`, `hid`, `advapi32`, `comctl32`, `ole32`). The icon is regenerated from `assets/generate-icon.ps1` if missing.
-
-## Troubleshooting
-
-**The tray icon shows "unavailable" and the menu has nothing useful.**
-Run `SuperLightBattery.exe --probe` from a terminal. It will list which Logitech HID collections are detected and which (if any) answer HID++. Make sure the receiver is plugged in and the mouse is paired and on.
-
-**Why are there two app executables?**
-`SuperLightBattery.exe` is the real tray and CLI app. `SuperLightBatteryLauncher.exe` is the tiny windowless startup launcher shown by Startup Apps.
-
-**Icon looks blurry on a high-DPI display.**
-The tray icon renders at the shell's requested pixel size with 4× supersampling and is per-monitor DPI aware. If it still looks soft, open an issue and include your DPI scaling (Settings → System → Display → Scale).
-
-**Installer says a SuperLightBattery file must sit next to the installer.**
-The tray/CLI app, startup launcher, and installer need to be in the same folder. The release zip ships them that way already; re-download the full archive if they got separated.
-
-**Tray won't exit during uninstall.**
-The installer posts `WM_CLOSE` to the tray window and waits briefly. If the tray was unresponsive at that moment, exit it manually from its right-click menu and run uninstall again. The locked files were already scheduled for deletion at next reboot.
 
 ## Releases
 

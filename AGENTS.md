@@ -2,7 +2,7 @@
 
 ## Implementation Defaults
 
-- Prefer C with direct Win32, SetupAPI, and HID APIs.
+- Prefer C with direct Win32, cfgmgr32, and HID APIs.
 
 Optimize for:
 

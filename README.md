@@ -2,13 +2,13 @@
 
 A tiny Windows battery indicator for the Logitech PRO X Superlight, no G HUB, no service, no telemetry.
 
-SuperLightBattery shows the battery level of an original Logitech PRO X Superlight in the system tray. Small native binaries, statically linked, no background framework. Tested on Windows 11.
+SuperLightBattery shows the battery level of an original Logitech PRO X Superlight in the system tray. Small native binaries, statically linked, no background framework. Tested on Windows 11; requires Windows 10 version 1703 or later.
 
 ## Compatibility
 
 Tested with the original Logitech PRO X Superlight.
 
-Other Logitech LIGHTSPEED / HID++ mice, including the PRO X Superlight 2, may or may not work. Reports are welcome.
+Other Logitech LIGHTSPEED / HID++ devices that report a battery percentage (HID++ features `0x1004` Unified Battery or `0x1000` Battery Status), including the PRO X Superlight 2, may or may not work. Older devices that only report a voltage are not supported. Reports are welcome.
 
 ## Install
 
@@ -21,21 +21,21 @@ No admin rights are required. Files go to `%LOCALAPPDATA%\SuperLightBattery` and
 
 ## Use
 
-The tray icon shows battery state as a vertical fill on a battery silhouette.
+The tray icon is a standing battery whose fill shows the level; hover over it for the exact percentage. It follows the taskbar theme (light or dark) automatically.
 
-- **Green** above 50 %, **amber** 21–50 %, **red** at 20 % and below.
-- A black lightning bolt overlay means the mouse reports it is charging.
-- An empty grey bar means the percent is unknown (voltage-only firmware, coarse state, or no device).
+- The fill is **green** above 50 %, **amber** 21–50 %, **red** at 20 % and below.
+- A **blue** fill means the device is charging.
+- An empty battery means there is no reading yet, for example when the mouse has been asleep since the tray started.
+- With several devices, the icon shows the lowest battery among the connected ones, and the tooltip lists every device. A device that is asleep or switched off keeps its last value, marked "(offline)".
 
 | Action on the icon | What happens |
 | --- | --- |
-| Hover | Tooltip with device name, percent, state, and DPI. Triggers a refresh at most once a minute. |
-| Right-click | Opens the menu and triggers an immediate refresh. |
-| Double-click | Triggers an immediate refresh. |
-| Refresh menu item | Same as double-click. |
+| Hover | Tooltip with each device's battery level and state. |
+| Right-click | Reads fresh values and opens the menu with battery, DPI, and onboard profile for each device. |
+| Refresh menu item | Detects devices again and re-reads everything. |
 | Exit menu item | Closes the tray app. The startup entry stays in place, so it will run again at next logon unless you uninstall. |
 
-There is no background polling. The tray sleeps in `GetMessage` until you interact with the icon or a HID device-change notification fires.
+There is no polling. The tray keeps the receiver's HID++ channel open and sleeps until a device reports something by itself: a battery change, charging starting or stopping, the mouse waking up or going to sleep, or a device being plugged in. SuperLightBattery only reads; it never changes device settings.
 
 ## Uninstall
 
@@ -52,47 +52,54 @@ This deletes the files, removes the startup shortcut and stops the running tray.
 For scripting and one-off checks, `SuperLightBattery.exe` has a small CLI:
 
 ```powershell
-SuperLightBattery.exe --list-devices   # list candidate Logitech HID interfaces
-SuperLightBattery.exe --probe          # test HID++ communication and battery feature
-SuperLightBattery.exe --once           # print a single JSON snapshot and exit
+SuperLightBattery.exe --list-devices   # list Logitech HID++ collections
+SuperLightBattery.exe --probe          # show which devices answer and their battery feature
+SuperLightBattery.exe --once           # print a JSON snapshot of every device and exit
 ```
 
 `--once` example output:
 
 ```json
 {
-  "battery": {
-    "percent": 46,
-    "state": "Discharging",
-    "charging": false,
-    "source": "Unified battery 0x1004"
-  },
-  "device": {
-    "name": "PRO X Wireless",
-    "hid_product": "USB Receiver",
-    "transport": "receiver",
-    "vid": "VID_046D",
-    "pid": "PID_C547",
-    "hidpp_device_index": "0x01"
-  },
-  "dpi": {
-    "current": 1600,
-    "min": 100,
-    "max": 25600
-  },
-  "profile": {
-    "index": 1,
-    "dpi_slot": 2
-  }
+  "devices": [
+    {
+      "battery": {
+        "percent": 46,
+        "state": "Discharging",
+        "charging": false,
+        "source": "Unified battery 0x1004"
+      },
+      "device": {
+        "name": "PRO X Wireless",
+        "hid_product": "USB Receiver",
+        "transport": "receiver",
+        "vid": "VID_046D",
+        "pid": "PID_C547",
+        "hidpp_device_index": "0x01"
+      },
+      "dpi": {
+        "current": 1600,
+        "min": 100,
+        "max": 25600
+      },
+      "profile": {
+        "index": 1,
+        "dpi_slot": 2
+      }
+    }
+  ]
 }
 ```
 
 Notes:
 
+- `devices` lists every device that answered. It is empty, and the exit code is 1, when none did.
 - `battery.percent` is firmware-reported.
-- `battery.source` names the HID++ feature or register that supplied the value.
+- `battery.source` names the HID++ feature that supplied the value.
 - `device.name` is the firmware-reported name; `device.hid_product` is the generic Windows HID product string.
+- `device.transport` is `wired` for a device on its cable and `receiver` for one behind a receiver.
 - Unsupported sections come back as `null`.
+- The CLI can run while the tray is running.
 
 ## Build from source
 
@@ -110,7 +117,7 @@ out\SuperLightBatteryLauncher.exe
 out\SuperLightBatteryInstaller.exe
 ```
 
-The app and installer are statically linked against the MSVC CRT (`/MT`); the small startup launcher is CRT-free. The binaries depend only on core Windows DLLs (`kernel32`, `user32`, `gdi32`, `shell32`, `setupapi`, `hid`, `advapi32`, `comctl32`, `ole32`). The icon is regenerated from `assets/generate-icon.ps1` if missing.
+The app and installer are statically linked against the MSVC CRT (`/MT`); the small startup launcher is CRT-free. The binaries depend only on core Windows DLLs (`kernel32`, `user32`, `gdi32`, `shell32`, `cfgmgr32`, `hid`, `advapi32`, `comctl32`, `ole32`). The icon is regenerated from `assets/generate-icon.ps1` if missing.
 
 ## Releases
 

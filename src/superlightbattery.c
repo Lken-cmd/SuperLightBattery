@@ -1,129 +1,91 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <cfgmgr32.h>
 #include <dbt.h>
-#include <setupapi.h>
 #include <hidsdi.h>
 #include <hidpi.h>
 #include <shellapi.h>
 #include <strsafe.h>
+#include <initguid.h>
+#include <devpkey.h>
 
-#include <stdbool.h>
-#include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
 
-#include "resource.h"
-
-#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-typedef HANDLE DPI_AWARENESS_CONTEXT;
-#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
-#endif
-typedef BOOL (WINAPI *SetProcessDpiAwarenessContextFn)(DPI_AWARENESS_CONTEXT);
-typedef int (WINAPI *GetSystemMetricsForDpiFn)(int, UINT);
-typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
-
 #define LOGITECH_VID 0x046D
+#define HIDPP_USAGE_PAGE 0xFF00
 #define HIDPP_REPORT_SHORT 0x10
 #define HIDPP_REPORT_LONG 0x11
 #define HIDPP_SHORT_LEN 7
 #define HIDPP_LONG_LEN 20
-#define HIDPP_SW_ID 0x01
-#define HIDPP10_GET_REGISTER 0x81
-#define HIDPP10_BATTERY_REGISTER 0x07
+#define HIDPP_TRAY_SW_ID 0x01
+#define HIDPP_CLI_SW_ID 0x02
+#define HIDPP10_ERROR 0x8F
+#define HIDPP20_ERROR 0xFF
+#define HIDPP10_CONNECTION 0x41
+#define HIDPP10_LINK_DOWN 0x40
+#define HIDPP_DIRECT_INDEX 0xFF
+#define HIDPP_SLOTS 7
+#define HIDPP_ALL_SLOTS ((BYTE)((1u << HIDPP_SLOTS) - 1))
+#define HIDPP_REPLY_TIMEOUT_MS 4000
+#define HIDPP_MENU_TIMEOUT_MS 1000
 
-#define HIDPP_FEATURE_FEATURE_SET 0x0001
-#define HIDPP_FEATURE_DEVICE_NAME_TYPE 0x0005
+#define HIDPP_FEATURE_DEVICE_NAME 0x0005
+#define HIDPP_FEATURE_BATTERY_STATUS 0x1000
+#define HIDPP_FEATURE_UNIFIED_BATTERY 0x1004
 #define HIDPP_FEATURE_ADJUSTABLE_DPI 0x2201
 #define HIDPP_FEATURE_ONBOARD_PROFILES 0x8100
 
-#define HIDPP_DEVICE_NAME_MAX 160
-
-#define MAX_HID_DEVICES 16
+#define DEVICE_NAME_MAX 64
+#define PRODUCT_NAME_MAX 64
 #define MAX_HID_PATH_CHARS 512
-#define HID_IO_BUFFER_LEN 256
-#define HIDPP_READ_TIMEOUT_MS 250
-#define HIDPP_CANCEL_WAIT_MS 100
-#define HIDPP_READ_ATTEMPTS 8
+#define MAX_CANDIDATES 16
+#define MAX_PORTS 8
+#define MAX_DEVICES 8
 
 #define WM_TRAYICON (WM_APP + 1)
-#define WM_REFRESH_COMPLETE (WM_APP + 2)
 #define TRAY_UID 1
-#define TRAY_MENU_BATTERY 1001
+#define TRAY_RESCAN_TIMER 1
+#define TRAY_RESCAN_DELAY_MS 5000
 #define TRAY_MENU_REFRESH 1002
 #define TRAY_MENU_EXIT 1003
-#define HOVER_REFRESH_COOLDOWN_MS 60000
-#define HID_QUERY_LOCK_TIMEOUT_MS 15000
-
-#ifndef NIF_SHOWTIP
-#define NIF_SHOWTIP 0x00000080
-#endif
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
-typedef enum TransportKind {
-    TRANSPORT_UNKNOWN = 0,
-    TRANSPORT_RECEIVER,
-    TRANSPORT_WIRED
-} TransportKind;
+typedef enum HidppStatus {
+    HIDPP_FAILED = 0,
+    HIDPP_OK,
+    HIDPP_REJECTED
+} HidppStatus;
 
-typedef enum BatteryConfidence {
-    BATTERY_CONFIDENCE_NONE = 0,
-    BATTERY_CONFIDENCE_PERCENT,
-    BATTERY_CONFIDENCE_COARSE,
-    BATTERY_CONFIDENCE_VOLTAGE
-} BatteryConfidence;
+typedef enum SlotState {
+    SLOT_UNKNOWN = 0,
+    SLOT_ABSENT,
+    SLOT_READY
+} SlotState;
 
 typedef struct HidCandidate {
     WCHAR path[MAX_HID_PATH_CHARS];
-    WCHAR product[160];
-    USHORT vid;
+    WCHAR product[PRODUCT_NAME_MAX];
+    DEVINST parent;
     USHORT pid;
-    USHORT usagePage;
     USHORT usage;
     USHORT inputReportBytes;
     USHORT outputReportBytes;
-    USHORT featureReportBytes;
-    BOOL vendorDefined;
-    BOOL likelyHidpp;
-    TransportKind transport;
 } HidCandidate;
 
-typedef struct HidppIo {
+typedef struct HidPipe {
     HANDLE handle;
-    DWORD inputReportBytes;
-    DWORD outputReportBytes;
-} HidppIo;
-
-typedef struct HidOverlappedOp {
-    OVERLAPPED overlapped;
     HANDLE event;
-    struct HidOverlappedOp *next;
-} HidOverlappedOp;
-
-typedef struct ProbeResult {
-    BOOL opened;
-    BOOL hidpp;
-    BOOL hasBatteryFeature;
-    BYTE deviceIndex;
-    WCHAR featureName[48];
-} ProbeResult;
-
-typedef struct BatteryResult {
-    BOOL found;
-    BatteryConfidence confidence;
-    TransportKind transport;
-    BYTE deviceIndex;
-    USHORT vid;
-    USHORT pid;
-    WCHAR product[160];
-    WCHAR source[48];
-    int percent;
-    int millivolts;
-    WCHAR state[32];
-    BOOL charging;
-} BatteryResult;
+    HDEVNOTIFY notify;
+    OVERLAPPED overlapped;
+    DWORD reportBytes;
+    BOOL pending;
+    BYTE report[HIDPP_LONG_LEN];
+} HidPipe;
 
 typedef struct DpiInfo {
     BOOL found;
@@ -138,591 +100,66 @@ typedef struct ProfileInfo {
     int currentDpiIndex;
 } ProfileInfo;
 
-typedef struct DeviceDetails {
-    BOOL firmwareNameFound;
-    WCHAR firmwareName[HIDPP_DEVICE_NAME_MAX];
+typedef struct HidppPort HidppPort;
+
+/* One physical device, keyed by its firmware name so a mouse seen on the cable and on the receiver stays one entry. */
+typedef struct Device {
+    BOOL used;
+    BOOL online;
+    BOOL batteryKnown;
+    BOOL charging;
+    int percent;
+    const WCHAR *state;
+    HidppPort *port;
+    BYTE index;
+    WCHAR name[DEVICE_NAME_MAX];
     DpiInfo dpi;
     ProfileInfo profile;
-} DeviceDetails;
+} Device;
 
-typedef struct DeviceSnapshot {
-    BatteryResult battery;
-    HidCandidate device;
-    DeviceDetails details;
-} DeviceSnapshot;
+typedef struct DeviceSlot {
+    SlotState state;
+    BOOL detailFeaturesKnown;
+    BYTE batteryFeature;
+    BYTE dpiFeature;
+    BYTE profileFeature;
+    USHORT batteryFeatureId;
+    Device *device;
+} DeviceSlot;
 
-static const WCHAR *TransportName(TransportKind transport)
-{
-    switch (transport) {
-    case TRANSPORT_RECEIVER:
-        return L"receiver";
-    case TRANSPORT_WIRED:
-        return L"wired";
-    default:
-        return L"unknown";
-    }
-}
+/* One HID++ interface: the long collection carries requests and device events, the short one receiver notices and errors. */
+struct HidppPort {
+    BOOL used;
+    BOOL dead;
+    DEVINST parent;
+    USHORT pid;
+    BYTE pendingSlots;
+    BYTE readSlots;
+    WCHAR product[PRODUCT_NAME_MAX];
+    HANDLE writeEvent;
+    HidPipe longPipe;
+    HidPipe shortPipe;
+    DeviceSlot slots[HIDPP_SLOTS];
+};
+
+static HidppPort g_ports[MAX_PORTS];
+static Device g_devices[MAX_DEVICES];
+static BYTE g_swId = HIDPP_CLI_SW_ID;
+/* A device that has been idle for minutes can take seconds to answer the first request. */
+static DWORD g_replyTimeoutMs = HIDPP_REPLY_TIMEOUT_MS;
+static BOOL g_rescanPending = FALSE;
+static BOOL g_trayDirty = FALSE;
+/* Set only in tray mode; open devices are then registered for removal requests. */
+static HWND g_trayWindow = NULL;
 
 static BOOL ContainsNoCase(const WCHAR *haystack, const WCHAR *needle)
 {
-    if (!haystack || !needle) {
-        return FALSE;
-    }
-
     return FindStringOrdinal(FIND_FROMSTART, haystack, -1, needle, -1, TRUE) >= 0;
-}
-
-static BOOL MultiSzContainsNoCase(const WCHAR *multiSz, DWORD bytes, const WCHAR *needle)
-{
-    size_t chars = bytes / sizeof(WCHAR);
-    size_t offset = 0;
-
-    while (offset < chars && multiSz[offset]) {
-        size_t start = offset;
-
-        while (offset < chars && multiSz[offset]) {
-            ++offset;
-        }
-        if (offset < chars && ContainsNoCase(&multiSz[start], needle)) {
-            return TRUE;
-        }
-        ++offset;
-    }
-
-    return FALSE;
-}
-
-static BOOL DeviceNodeMayBeLogitech(HDEVINFO deviceInfoSet, SP_DEVINFO_DATA *devInfoData)
-{
-    WCHAR stackIds[512];
-    WCHAR *heapIds = NULL;
-    WCHAR *ids = stackIds;
-    DWORD idsBytes = sizeof(stackIds);
-    DWORD requiredBytes = 0;
-    DWORD propertyType = 0;
-    BOOL ok;
-    BOOL result = TRUE;
-
-    ok = SetupDiGetDeviceRegistryPropertyW(
-        deviceInfoSet,
-        devInfoData,
-        SPDRP_HARDWAREID,
-        &propertyType,
-        (PBYTE)ids,
-        idsBytes,
-        &requiredBytes);
-
-    if (!ok && GetLastError() == ERROR_INSUFFICIENT_BUFFER && requiredBytes > 0) {
-        heapIds = (WCHAR *)malloc((size_t)requiredBytes + sizeof(WCHAR));
-        if (!heapIds) {
-            return TRUE;
-        }
-
-        ids = heapIds;
-        idsBytes = requiredBytes + sizeof(WCHAR);
-        ZeroMemory(ids, idsBytes);
-        ok = SetupDiGetDeviceRegistryPropertyW(
-            deviceInfoSet,
-            devInfoData,
-            SPDRP_HARDWAREID,
-            &propertyType,
-            (PBYTE)ids,
-            requiredBytes,
-            &requiredBytes);
-    }
-
-    if (ok && (propertyType == REG_MULTI_SZ || propertyType == REG_SZ)) {
-        result = MultiSzContainsNoCase(ids, requiredBytes, L"VID_046D");
-    }
-
-    free(heapIds);
-    return result;
-}
-
-static TransportKind GuessTransport(const HidCandidate *device)
-{
-    if (ContainsNoCase(device->product, L"receiver") ||
-        ContainsNoCase(device->product, L"lightspeed") ||
-        device->pid == 0xC539 ||
-        device->pid == 0xC53A ||
-        device->pid == 0xC547 ||
-        device->pid == 0xC548 ||
-        device->pid == 0xC52B) {
-        return TRANSPORT_RECEIVER;
-    }
-
-    if (device->vendorDefined) {
-        return TRANSPORT_WIRED;
-    }
-
-    return TRANSPORT_UNKNOWN;
 }
 
 static const WCHAR *DisplayStringOrFallback(const WCHAR *value, const WCHAR *fallback)
 {
     return (value && value[0]) ? value : fallback;
-}
-
-static HANDLE g_hidQueryMutex = NULL;
-
-static BOOL AcquireHidQueryLock(void)
-{
-    DWORD waitResult;
-
-    if (!g_hidQueryMutex) {
-        g_hidQueryMutex = CreateMutexW(NULL, FALSE, L"Local\\SuperLightBatteryHidQuery");
-        if (!g_hidQueryMutex) {
-            return FALSE;
-        }
-    }
-
-    waitResult = WaitForSingleObject(g_hidQueryMutex, HID_QUERY_LOCK_TIMEOUT_MS);
-    if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED) {
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
-static void ReleaseHidQueryLock(void)
-{
-    if (g_hidQueryMutex) {
-        ReleaseMutex(g_hidQueryMutex);
-    }
-}
-
-static void CloseHidQueryLockHandle(void)
-{
-    if (g_hidQueryMutex) {
-        CloseHandle(g_hidQueryMutex);
-        g_hidQueryMutex = NULL;
-    }
-}
-
-static HidCandidate g_cachedDevice = {0};
-static BOOL g_cachedDeviceValid = FALSE;
-static SRWLOCK g_deviceCacheLock = SRWLOCK_INIT;
-
-static void InvalidateDeviceCache(void)
-{
-    AcquireSRWLockExclusive(&g_deviceCacheLock);
-    ZeroMemory(&g_cachedDevice, sizeof(g_cachedDevice));
-    g_cachedDeviceValid = FALSE;
-    ReleaseSRWLockExclusive(&g_deviceCacheLock);
-}
-
-static BOOL CopyCachedDevice(HidCandidate *device)
-{
-    BOOL valid;
-
-    AcquireSRWLockShared(&g_deviceCacheLock);
-    valid = g_cachedDeviceValid;
-    if (valid) {
-        *device = g_cachedDevice;
-    }
-    ReleaseSRWLockShared(&g_deviceCacheLock);
-    return valid;
-}
-
-static void StoreCachedDevice(const HidCandidate *device)
-{
-    AcquireSRWLockExclusive(&g_deviceCacheLock);
-    g_cachedDevice = *device;
-    g_cachedDeviceValid = TRUE;
-    ReleaseSRWLockExclusive(&g_deviceCacheLock);
-}
-
-static void CopyHidString(WCHAR *dst, size_t dstChars, HANDLE handle, BOOL product)
-{
-    if (dstChars == 0) {
-        return;
-    }
-
-    dst[0] = L'\0';
-    if (product) {
-        (void)HidD_GetProductString(handle, dst, (ULONG)(dstChars * sizeof(WCHAR)));
-    } else {
-        (void)HidD_GetManufacturerString(handle, dst, (ULONG)(dstChars * sizeof(WCHAR)));
-    }
-    dst[dstChars - 1] = L'\0';
-}
-
-static int EnumerateLogitechHidDevices(HidCandidate *devices, int maxDevices)
-{
-    GUID hidGuid;
-    HDEVINFO deviceInfoSet;
-    PSP_DEVICE_INTERFACE_DETAIL_DATA_W detailData = NULL;
-    DWORD detailDataBytes = 0;
-    int count = 0;
-
-    HidD_GetHidGuid(&hidGuid);
-    deviceInfoSet = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (deviceInfoSet == INVALID_HANDLE_VALUE) {
-        return 0;
-    }
-
-    for (DWORD index = 0; count < maxDevices; ++index) {
-        SP_DEVICE_INTERFACE_DATA interfaceData;
-        DWORD requiredSize = 0;
-        SP_DEVINFO_DATA devInfoData;
-        HANDLE handle = INVALID_HANDLE_VALUE;
-        HIDD_ATTRIBUTES attributes;
-        PHIDP_PREPARSED_DATA preparsedData = NULL;
-        HIDP_CAPS caps;
-        HidCandidate candidate;
-
-        ZeroMemory(&interfaceData, sizeof(interfaceData));
-        interfaceData.cbSize = sizeof(interfaceData);
-        if (!SetupDiEnumDeviceInterfaces(deviceInfoSet, NULL, &hidGuid, index, &interfaceData)) {
-            break;
-        }
-
-        (void)SetupDiGetDeviceInterfaceDetailW(deviceInfoSet, &interfaceData, NULL, 0, &requiredSize, NULL);
-        if (requiredSize == 0) {
-            continue;
-        }
-
-        if (requiredSize > detailDataBytes) {
-            void *newDetailData = realloc(detailData, requiredSize);
-            if (!newDetailData) {
-                break;
-            }
-            detailData = (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)newDetailData;
-            detailDataBytes = requiredSize;
-        }
-
-        ZeroMemory(detailData, detailDataBytes);
-        detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-        ZeroMemory(&devInfoData, sizeof(devInfoData));
-        devInfoData.cbSize = sizeof(devInfoData);
-
-        if (!SetupDiGetDeviceInterfaceDetailW(deviceInfoSet, &interfaceData, detailData, requiredSize, NULL, &devInfoData)) {
-            continue;
-        }
-
-        if (!DeviceNodeMayBeLogitech(deviceInfoSet, &devInfoData)) {
-            continue;
-        }
-
-        handle = CreateFileW(
-            detailData->DevicePath,
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            NULL);
-
-        if (handle == INVALID_HANDLE_VALUE) {
-            continue;
-        }
-
-        ZeroMemory(&attributes, sizeof(attributes));
-        attributes.Size = sizeof(attributes);
-        if (!HidD_GetAttributes(handle, &attributes) || attributes.VendorID != LOGITECH_VID) {
-            CloseHandle(handle);
-            continue;
-        }
-
-        ZeroMemory(&candidate, sizeof(candidate));
-        candidate.vid = attributes.VendorID;
-        candidate.pid = attributes.ProductID;
-        if (FAILED(StringCchCopyW(candidate.path, ARRAY_LEN(candidate.path), detailData->DevicePath))) {
-            CloseHandle(handle);
-            continue;
-        }
-        CopyHidString(candidate.product, ARRAY_LEN(candidate.product), handle, TRUE);
-
-        if (HidD_GetPreparsedData(handle, &preparsedData)) {
-            if (HidP_GetCaps(preparsedData, &caps) == HIDP_STATUS_SUCCESS) {
-                candidate.usagePage = caps.UsagePage;
-                candidate.usage = caps.Usage;
-                candidate.inputReportBytes = caps.InputReportByteLength;
-                candidate.outputReportBytes = caps.OutputReportByteLength;
-                candidate.featureReportBytes = caps.FeatureReportByteLength;
-            }
-            HidD_FreePreparsedData(preparsedData);
-        }
-
-        candidate.vendorDefined = (candidate.usagePage >= 0xFF00);
-        candidate.likelyHidpp =
-            candidate.vendorDefined &&
-            candidate.inputReportBytes >= HIDPP_SHORT_LEN &&
-            (candidate.outputReportBytes >= HIDPP_SHORT_LEN || candidate.featureReportBytes >= HIDPP_SHORT_LEN);
-        candidate.transport = GuessTransport(&candidate);
-
-        devices[count++] = candidate;
-
-        CloseHandle(handle);
-    }
-
-    free(detailData);
-    SetupDiDestroyDeviceInfoList(deviceInfoSet);
-    return count;
-}
-
-static BOOL OpenHidppIo(const HidCandidate *device, HidppIo *io)
-{
-    HANDLE handle = CreateFileW(
-        device->path,
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_FLAG_OVERLAPPED,
-        NULL);
-
-    if (handle == INVALID_HANDLE_VALUE) {
-        return FALSE;
-    }
-
-    io->handle = handle;
-    io->inputReportBytes = device->inputReportBytes;
-    io->outputReportBytes = device->outputReportBytes;
-    return TRUE;
-}
-
-static void CloseHidppIo(HidppIo *io)
-{
-    if (io->handle && io->handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(io->handle);
-    }
-    io->handle = INVALID_HANDLE_VALUE;
-}
-
-static HidOverlappedOp *g_abandonedHidIo = NULL;
-static SRWLOCK g_abandonedHidIoLock = SRWLOCK_INIT;
-
-static void DestroyHidOverlappedOp(HidOverlappedOp *op)
-{
-    if (!op) {
-        return;
-    }
-
-    if (op->event) {
-        CloseHandle(op->event);
-    }
-    free(op);
-}
-
-static void ReapAbandonedHidIo(void)
-{
-    HidOverlappedOp **link;
-
-    AcquireSRWLockExclusive(&g_abandonedHidIoLock);
-    link = &g_abandonedHidIo;
-    while (*link) {
-        HidOverlappedOp *op = *link;
-        DWORD wait = WaitForSingleObject(op->event, 0);
-
-        if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) {
-            *link = op->next;
-            DestroyHidOverlappedOp(op);
-        } else {
-            link = &op->next;
-        }
-    }
-    ReleaseSRWLockExclusive(&g_abandonedHidIoLock);
-}
-
-static HidOverlappedOp *CreateHidOverlappedOp(void)
-{
-    HidOverlappedOp *op;
-
-    ReapAbandonedHidIo();
-    op = (HidOverlappedOp *)calloc(1, sizeof(*op));
-    if (!op) {
-        return NULL;
-    }
-
-    op->event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!op->event) {
-        free(op);
-        return NULL;
-    }
-
-    op->overlapped.hEvent = op->event;
-    return op;
-}
-
-static void AbandonHidOverlappedOp(HidOverlappedOp *op)
-{
-    AcquireSRWLockExclusive(&g_abandonedHidIoLock);
-    op->next = g_abandonedHidIo;
-    g_abandonedHidIo = op;
-    ReleaseSRWLockExclusive(&g_abandonedHidIoLock);
-}
-
-static void CancelAndReleaseHidOverlapped(HANDLE handle, HidOverlappedOp *op)
-{
-    DWORD transferred = 0;
-
-    if (!CancelIoEx(handle, &op->overlapped) && GetLastError() == ERROR_NOT_FOUND) {
-        DestroyHidOverlappedOp(op);
-        return;
-    }
-
-    if (WaitForSingleObject(op->event, HIDPP_CANCEL_WAIT_MS) == WAIT_OBJECT_0) {
-        (void)GetOverlappedResult(handle, &op->overlapped, &transferred, FALSE);
-        DestroyHidOverlappedOp(op);
-        return;
-    }
-
-    AbandonHidOverlappedOp(op);
-}
-
-static BOOL OverlappedWriteWithTimeout(HANDLE handle, const BYTE *buffer, DWORD length, DWORD timeoutMs)
-{
-    HidOverlappedOp *op = CreateHidOverlappedOp();
-    DWORD transferred = 0;
-    BOOL ok;
-
-    if (!op) {
-        return FALSE;
-    }
-
-    ok = WriteFile(handle, buffer, length, NULL, &op->overlapped);
-    if (!ok && GetLastError() == ERROR_IO_PENDING) {
-        DWORD wait = WaitForSingleObject(op->event, timeoutMs);
-        if (wait == WAIT_OBJECT_0) {
-            ok = GetOverlappedResult(handle, &op->overlapped, &transferred, FALSE);
-        } else {
-            CancelAndReleaseHidOverlapped(handle, op);
-            return FALSE;
-        }
-    } else if (ok) {
-        ok = GetOverlappedResult(handle, &op->overlapped, &transferred, FALSE);
-    }
-
-    DestroyHidOverlappedOp(op);
-    return ok && transferred == length;
-}
-
-static BOOL OverlappedReadWithTimeout(HANDLE handle, BYTE *buffer, DWORD length, DWORD timeoutMs, DWORD *bytesRead)
-{
-    HidOverlappedOp *op = CreateHidOverlappedOp();
-    DWORD transferred = 0;
-    BOOL ok;
-
-    if (!op) {
-        return FALSE;
-    }
-
-    *bytesRead = 0;
-    ok = ReadFile(handle, buffer, length, NULL, &op->overlapped);
-    if (!ok && GetLastError() == ERROR_IO_PENDING) {
-        DWORD wait = WaitForSingleObject(op->event, timeoutMs);
-        if (wait == WAIT_OBJECT_0) {
-            ok = GetOverlappedResult(handle, &op->overlapped, &transferred, FALSE);
-        } else {
-            CancelAndReleaseHidOverlapped(handle, op);
-            return FALSE;
-        }
-    } else if (ok) {
-        ok = GetOverlappedResult(handle, &op->overlapped, &transferred, FALSE);
-    }
-
-    if (ok) {
-        *bytesRead = transferred;
-    }
-    DestroyHidOverlappedOp(op);
-    return ok;
-}
-
-static BOOL IsHidppErrorResponse(const BYTE *response, DWORD length)
-{
-    if (length < HIDPP_SHORT_LEN) {
-        return FALSE;
-    }
-
-    return response[2] == 0x8F || response[2] == 0xFF;
-}
-
-static BOOL HidppCall(
-    HidppIo *io,
-    BYTE deviceIndex,
-    BYTE featureIndex,
-    BYTE functionId,
-    const BYTE params[3],
-    BYTE response[HID_IO_BUFFER_LEN])
-{
-    BYTE frame[HIDPP_SHORT_LEN] = {0};
-    BYTE output[HID_IO_BUFFER_LEN];
-    BYTE input[HID_IO_BUFFER_LEN];
-    DWORD outputLen = io->outputReportBytes;
-    BYTE reportId = (io->outputReportBytes >= HIDPP_LONG_LEN && io->inputReportBytes >= HIDPP_LONG_LEN)
-        ? HIDPP_REPORT_LONG
-        : HIDPP_REPORT_SHORT;
-
-    if (outputLen < HIDPP_SHORT_LEN || outputLen > HID_IO_BUFFER_LEN ||
-        io->inputReportBytes < HIDPP_SHORT_LEN || io->inputReportBytes > HID_IO_BUFFER_LEN) {
-        return FALSE;
-    }
-
-    frame[0] = reportId;
-    frame[1] = deviceIndex;
-    frame[2] = featureIndex;
-    frame[3] = (BYTE)((functionId << 4) | HIDPP_SW_ID);
-    if (params) {
-        frame[4] = params[0];
-        frame[5] = params[1];
-        frame[6] = params[2];
-    }
-
-    ZeroMemory(output, outputLen);
-    CopyMemory(output, frame, sizeof(frame));
-
-    (void)HidD_FlushQueue(io->handle);
-    if (!OverlappedWriteWithTimeout(io->handle, output, outputLen, HIDPP_READ_TIMEOUT_MS)) {
-        return FALSE;
-    }
-
-    for (int attempt = 0; attempt < HIDPP_READ_ATTEMPTS; ++attempt) {
-        DWORD bytesRead = 0;
-
-        if (!OverlappedReadWithTimeout(io->handle, input, io->inputReportBytes, HIDPP_READ_TIMEOUT_MS, &bytesRead)) {
-            return FALSE;
-        }
-
-        if (bytesRead < HIDPP_SHORT_LEN || input[0] != reportId || input[1] != deviceIndex) {
-            continue;
-        }
-
-        if (IsHidppErrorResponse(input, bytesRead)) {
-            return FALSE;
-        }
-
-        if (input[2] == featureIndex && (input[3] & 0xF0) == (frame[3] & 0xF0)) {
-            CopyMemory(response, input, bytesRead);
-            if (bytesRead < HID_IO_BUFFER_LEN) {
-                ZeroMemory(response + bytesRead, HID_IO_BUFFER_LEN - bytesRead);
-            }
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-static BOOL HidppGetFeatureIndex(HidppIo *io, BYTE deviceIndex, USHORT featureId, BYTE *featureIndex)
-{
-    BYTE params[3];
-    BYTE response[HID_IO_BUFFER_LEN];
-
-    params[0] = (BYTE)((featureId >> 8) & 0xFF);
-    params[1] = (BYTE)(featureId & 0xFF);
-    params[2] = 0;
-
-    if (!HidppCall(io, deviceIndex, 0x00, 0x00, params, response)) {
-        return FALSE;
-    }
-
-    if (response[4] == 0 || response[4] == 0xFF) {
-        return FALSE;
-    }
-
-    *featureIndex = response[4];
-    return TRUE;
 }
 
 static int ReadBe16(const BYTE *bytes)
@@ -735,765 +172,890 @@ static BOOL IsPrintableAscii(BYTE value)
     return value >= 0x20 && value <= 0x7E;
 }
 
-static BOOL QueryFirmwareDeviceName(HidppIo *io, BYTE deviceIndex, DeviceDetails *details)
+static int SlotForIndex(BYTE index)
 {
-    BYTE featureIndex;
-    BYTE response[HID_IO_BUFFER_LEN];
-    BYTE params[3] = {0, 0, 0};
-    int nameLen;
-    int copied = 0;
+    if (index == HIDPP_DIRECT_INDEX) {
+        return 0;
+    }
+    return (index >= 1 && index < HIDPP_SLOTS) ? index : -1;
+}
 
-    if (!HidppGetFeatureIndex(io, deviceIndex, HIDPP_FEATURE_DEVICE_NAME_TYPE, &featureIndex)) {
+static BYTE IndexForSlot(int slot)
+{
+    return slot == 0 ? HIDPP_DIRECT_INDEX : (BYTE)slot;
+}
+
+static BOOL ReadParentDevNode(const WCHAR *path, DEVINST *parent)
+{
+    WCHAR instanceId[MAX_DEVICE_ID_LEN];
+    ULONG bytes = sizeof(instanceId);
+    DEVPROPTYPE type;
+    DEVINST devNode;
+
+    return CM_Get_Device_Interface_PropertyW(path, &DEVPKEY_Device_InstanceId, &type, (PBYTE)instanceId, &bytes, 0) == CR_SUCCESS &&
+        CM_Locate_DevNodeW(&devNode, instanceId, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
+        CM_Get_Parent(parent, devNode, 0) == CR_SUCCESS;
+}
+
+static BOOL ReadCandidate(HidCandidate *candidate)
+{
+    HANDLE handle = CreateFileW(candidate->path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    HIDD_ATTRIBUTES attributes;
+    PHIDP_PREPARSED_DATA preparsedData = NULL;
+    HIDP_CAPS caps;
+    BOOL ok;
+
+    if (handle == INVALID_HANDLE_VALUE) {
         return FALSE;
     }
 
-    if (!HidppCall(io, deviceIndex, featureIndex, 0x00, params, response)) {
-        return FALSE;
+    ZeroMemory(&attributes, sizeof(attributes));
+    attributes.Size = sizeof(attributes);
+    ZeroMemory(&caps, sizeof(caps));
+    ok = HidD_GetAttributes(handle, &attributes) && attributes.VendorID == LOGITECH_VID &&
+        HidD_GetPreparsedData(handle, &preparsedData);
+    if (ok) {
+        ok = HidP_GetCaps(preparsedData, &caps) == HIDP_STATUS_SUCCESS && caps.UsagePage == HIDPP_USAGE_PAGE &&
+            (caps.InputReportByteLength == HIDPP_SHORT_LEN ||
+             (caps.InputReportByteLength == HIDPP_LONG_LEN && caps.OutputReportByteLength == HIDPP_LONG_LEN));
+        HidD_FreePreparsedData(preparsedData);
     }
 
-    nameLen = response[4];
-    if (nameLen <= 0 || nameLen >= HIDPP_DEVICE_NAME_MAX) {
-        return FALSE;
+    if (ok) {
+        candidate->pid = attributes.ProductID;
+        candidate->usage = caps.Usage;
+        candidate->inputReportBytes = caps.InputReportByteLength;
+        candidate->outputReportBytes = caps.OutputReportByteLength;
+        candidate->product[0] = L'\0';
+        (void)HidD_GetProductString(handle, candidate->product, sizeof(candidate->product));
+        candidate->product[ARRAY_LEN(candidate->product) - 1] = L'\0';
+        ok = ReadParentDevNode(candidate->path, &candidate->parent);
     }
 
-    ZeroMemory(details->firmwareName, sizeof(details->firmwareName));
-    while (copied < nameLen && copied < HIDPP_DEVICE_NAME_MAX - 1) {
-        int chunkOffset = copied;
+    CloseHandle(handle);
+    return ok;
+}
 
-        params[0] = (BYTE)chunkOffset;
-        params[1] = 0;
-        params[2] = 0;
-        if (!HidppCall(io, deviceIndex, featureIndex, 0x01, params, response)) {
-            break;
+static int EnumerateHidppCandidates(HidCandidate *candidates, int maxCandidates)
+{
+    GUID hidGuid;
+    WCHAR *list = NULL;
+    ULONG listChars = 0;
+    CONFIGRET result;
+    int count = 0;
+
+    HidD_GetHidGuid(&hidGuid);
+    do {
+        free(list);
+        list = NULL;
+        if (CM_Get_Device_Interface_List_SizeW(&listChars, &hidGuid, NULL, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS) {
+            return 0;
         }
-
-        for (int i = 4; i < 20 && copied < nameLen && copied < HIDPP_DEVICE_NAME_MAX - 1; ++i) {
-            BYTE ch = response[i];
-
-            if (ch == 0) {
-                break;
-            }
-            details->firmwareName[copied++] = IsPrintableAscii(ch) ? (WCHAR)ch : L'?';
+        list = (WCHAR *)malloc((size_t)listChars * sizeof(WCHAR));
+        if (!list) {
+            return 0;
         }
+        result = CM_Get_Device_Interface_ListW(&hidGuid, NULL, list, listChars, CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+    } while (result == CR_BUFFER_SMALL);
 
-        if (copied == chunkOffset) {
-            break;
-        }
-    }
+    for (const WCHAR *path = list; result == CR_SUCCESS && *path && count < maxCandidates; path += wcslen(path) + 1) {
+        HidCandidate *candidate = &candidates[count];
 
-    if (copied <= 0) {
-        details->firmwareName[0] = L'\0';
-        return FALSE;
-    }
-
-    details->firmwareName[copied] = L'\0';
-    details->firmwareNameFound = TRUE;
-
-    return TRUE;
-}
-
-static BOOL QueryDpiInfo(HidppIo *io, BYTE deviceIndex, DpiInfo *dpi)
-{
-    BYTE featureIndex;
-    BYTE response[HID_IO_BUFFER_LEN];
-    BYTE params[3] = {0, 0, 0};
-    int sensorCount;
-
-    if (!HidppGetFeatureIndex(io, deviceIndex, HIDPP_FEATURE_ADJUSTABLE_DPI, &featureIndex)) {
-        return FALSE;
-    }
-
-    if (!HidppCall(io, deviceIndex, featureIndex, 0x00, params, response)) {
-        return FALSE;
-    }
-
-    sensorCount = response[4];
-    if (sensorCount <= 0 || sensorCount > 16) {
-        return FALSE;
-    }
-
-    params[0] = 0;
-    params[1] = 0;
-    params[2] = 0;
-    if (HidppCall(io, deviceIndex, featureIndex, 0x01, params, response)) {
-        int minDpi = 0;
-        int maxDpi = 0;
-
-        for (int i = 5; i + 1 < 20; i += 2) {
-            int value = ReadBe16(&response[i]);
-
-            if (value == 0) {
-                break;
-            }
-
-            if (value > 0xE000) {
-                continue;
-            } else {
-                if (minDpi == 0 || value < minDpi) {
-                    minDpi = value;
-                }
-                if (value > maxDpi) {
-                    maxDpi = value;
-                }
-            }
-        }
-
-        dpi->minDpi = minDpi;
-        dpi->maxDpi = maxDpi;
-    }
-
-    if (!HidppCall(io, deviceIndex, featureIndex, 0x02, params, response)) {
-        return FALSE;
-    }
-
-    dpi->currentDpi = ReadBe16(&response[5]);
-    dpi->found = dpi->currentDpi > 0;
-
-    return dpi->found;
-}
-
-static BOOL QueryProfileInfo(HidppIo *io, BYTE deviceIndex, ProfileInfo *profile)
-{
-    BYTE featureIndex;
-    BYTE response[HID_IO_BUFFER_LEN];
-    BYTE params[3] = {0, 0, 0};
-    BOOL gotAny = FALSE;
-
-    if (!HidppGetFeatureIndex(io, deviceIndex, HIDPP_FEATURE_ONBOARD_PROFILES, &featureIndex)) {
-        return FALSE;
-    }
-
-    profile->rawIndex = -1;
-    profile->currentDpiIndex = -1;
-    if (HidppCall(io, deviceIndex, featureIndex, 0x04, params, response)) {
-        profile->rawIndex = response[5];
-        gotAny = TRUE;
-    }
-
-    if (HidppCall(io, deviceIndex, featureIndex, 0x0B, params, response)) {
-        profile->currentDpiIndex = response[4];
-        gotAny = TRUE;
-    }
-
-    profile->found = gotAny;
-    return gotAny;
-}
-
-static void QueryDeviceDetails(HidppIo *io, BYTE deviceIndex, DeviceDetails *details)
-{
-    ZeroMemory(details, sizeof(*details));
-    details->profile.rawIndex = -1;
-    details->profile.currentDpiIndex = -1;
-
-    (void)QueryFirmwareDeviceName(io, deviceIndex, details);
-    (void)QueryDpiInfo(io, deviceIndex, &details->dpi);
-    (void)QueryProfileInfo(io, deviceIndex, &details->profile);
-}
-
-static void SetBatteryState(BatteryResult *result, const WCHAR *state, BOOL charging)
-{
-    (void)StringCchCopyW(result->state, ARRAY_LEN(result->state), state);
-    result->charging = charging;
-}
-
-static BOOL SetBatteryStateFromStatus(BatteryResult *result, BYTE status)
-{
-    switch (status) {
-    case 0x00:
-        SetBatteryState(result, L"Discharging", FALSE);
-        return TRUE;
-    case 0x01:
-        SetBatteryState(result, L"Charging", TRUE);
-        return TRUE;
-    case 0x02:
-        SetBatteryState(result, L"Charging", TRUE);
-        return TRUE;
-    case 0x03:
-        SetBatteryState(result, L"Full", FALSE);
-        return TRUE;
-    case 0x04:
-        SetBatteryState(result, L"Charging slowly", TRUE);
-        return TRUE;
-    default:
-        return FALSE;
-    }
-}
-
-static const WCHAR *CoarseLevelFromPercent(int percent)
-{
-    if (percent >= 90) {
-        return L"Full";
-    }
-    if (percent >= 20) {
-        return L"Good";
-    }
-    if (percent >= 10) {
-        return L"Low";
-    }
-    return L"Critical";
-}
-
-static const WCHAR *CoarseLevelFromEnum(BYTE level)
-{
-    switch (level) {
-    case 1:
-        return L"Critical";
-    case 2:
-        return L"Low";
-    case 3:
-        return L"Good";
-    case 4:
-        return L"Full";
-    default:
-        return NULL;
-    }
-}
-
-static BOOL ParsePercentBattery(
-    BatteryResult *result,
-    const HidCandidate *device,
-    BYTE deviceIndex,
-    USHORT featureId,
-    const WCHAR *sourceName,
-    const BYTE response[HID_IO_BUFFER_LEN])
-{
-    BYTE percent = response[4];
-    BYTE status = response[6];
-
-    if (percent > 100) {
-        return FALSE;
-    }
-
-    result->found = TRUE;
-    result->confidence = BATTERY_CONFIDENCE_PERCENT;
-    result->transport = device->transport;
-    result->deviceIndex = deviceIndex;
-    result->vid = device->vid;
-    result->pid = device->pid;
-    result->percent = percent;
-    (void)StringCchCopyW(result->product, ARRAY_LEN(result->product), DisplayStringOrFallback(device->product, L"Logitech HID device"));
-    (void)StringCchPrintfW(result->source, ARRAY_LEN(result->source), L"%s 0x%04X", sourceName, featureId);
-    (void)StringCchCopyW(result->state, ARRAY_LEN(result->state), CoarseLevelFromPercent(percent));
-    SetBatteryStateFromStatus(result, status);
-    return TRUE;
-}
-
-static BOOL ParseVoltageBattery(
-    BatteryResult *result,
-    const HidCandidate *device,
-    BYTE deviceIndex,
-    const BYTE response[HID_IO_BUFFER_LEN])
-{
-    int millivolts = ((int)response[4] << 8) | response[5];
-    BYTE status = response[6];
-
-    if (millivolts < 2500 || millivolts > 5500) {
-        return FALSE;
-    }
-
-    result->found = TRUE;
-    result->confidence = BATTERY_CONFIDENCE_VOLTAGE;
-    result->transport = device->transport;
-    result->deviceIndex = deviceIndex;
-    result->vid = device->vid;
-    result->pid = device->pid;
-    result->millivolts = millivolts;
-    (void)StringCchCopyW(result->product, ARRAY_LEN(result->product), DisplayStringOrFallback(device->product, L"Logitech HID device"));
-    (void)StringCchCopyW(result->source, ARRAY_LEN(result->source), L"Battery voltage 0x1001");
-    (void)StringCchCopyW(result->state, ARRAY_LEN(result->state), L"Voltage only");
-    SetBatteryStateFromStatus(result, status);
-    return TRUE;
-}
-
-static BOOL Hidpp10ReadRegister(HidppIo *io, BYTE deviceIndex, BYTE registerId, BYTE response[HID_IO_BUFFER_LEN])
-{
-    BYTE output[HID_IO_BUFFER_LEN];
-    BYTE input[HID_IO_BUFFER_LEN];
-    DWORD outputLen = io->outputReportBytes;
-    BYTE reportId = (io->outputReportBytes >= HIDPP_LONG_LEN && io->inputReportBytes >= HIDPP_LONG_LEN)
-        ? HIDPP_REPORT_LONG
-        : HIDPP_REPORT_SHORT;
-
-    if (outputLen < HIDPP_SHORT_LEN || outputLen > HID_IO_BUFFER_LEN ||
-        io->inputReportBytes < HIDPP_SHORT_LEN || io->inputReportBytes > HID_IO_BUFFER_LEN) {
-        return FALSE;
-    }
-
-    ZeroMemory(output, outputLen);
-    output[0] = reportId;
-    output[1] = deviceIndex;
-    output[2] = HIDPP10_GET_REGISTER;
-    output[3] = registerId;
-
-    (void)HidD_FlushQueue(io->handle);
-    if (!OverlappedWriteWithTimeout(io->handle, output, outputLen, HIDPP_READ_TIMEOUT_MS)) {
-        return FALSE;
-    }
-
-    for (int attempt = 0; attempt < HIDPP_READ_ATTEMPTS; ++attempt) {
-        DWORD bytesRead = 0;
-
-        if (!OverlappedReadWithTimeout(io->handle, input, io->inputReportBytes, HIDPP_READ_TIMEOUT_MS, &bytesRead)) {
-            return FALSE;
-        }
-
-        if (bytesRead < HIDPP_SHORT_LEN || input[0] != reportId || input[1] != deviceIndex) {
-            continue;
-        }
-
-        if (IsHidppErrorResponse(input, bytesRead)) {
-            return FALSE;
-        }
-
-        if (input[2] == HIDPP10_GET_REGISTER && input[3] == registerId) {
-            CopyMemory(response, input, bytesRead);
-            if (bytesRead < HID_IO_BUFFER_LEN) {
-                ZeroMemory(response + bytesRead, HID_IO_BUFFER_LEN - bytesRead);
-            }
-            return TRUE;
+        if (ContainsNoCase(path, L"VID_046D") &&
+            SUCCEEDED(StringCchCopyW(candidate->path, ARRAY_LEN(candidate->path), path)) &&
+            ReadCandidate(candidate)) {
+            ++count;
         }
     }
 
-    return FALSE;
-}
-
-static BOOL ParseHidpp10Battery(
-    BatteryResult *result,
-    const HidCandidate *device,
-    BYTE deviceIndex,
-    const BYTE response[HID_IO_BUFFER_LEN])
-{
-    BYTE level = response[4];
-    BYTE statusA = response[5];
-    BYTE statusB = response[6];
-    const WCHAR *coarse = CoarseLevelFromEnum(level);
-
-    result->found = TRUE;
-    result->transport = device->transport;
-    result->deviceIndex = deviceIndex;
-    result->vid = device->vid;
-    result->pid = device->pid;
-    (void)StringCchCopyW(result->product, ARRAY_LEN(result->product), DisplayStringOrFallback(device->product, L"Logitech HID device"));
-    (void)StringCchCopyW(result->source, ARRAY_LEN(result->source), L"HID++ 1.0 battery register");
-
-    if (level > 4 && level <= 100) {
-        result->confidence = BATTERY_CONFIDENCE_PERCENT;
-        result->percent = level;
-        (void)StringCchCopyW(result->state, ARRAY_LEN(result->state), CoarseLevelFromPercent(level));
-        (void)SetBatteryStateFromStatus(result, statusA);
-        (void)SetBatteryStateFromStatus(result, statusB);
-        return TRUE;
-    }
-
-    if (coarse) {
-        result->confidence = BATTERY_CONFIDENCE_COARSE;
-        (void)StringCchCopyW(result->state, ARRAY_LEN(result->state), coarse);
-        (void)SetBatteryStateFromStatus(result, statusA);
-        (void)SetBatteryStateFromStatus(result, statusB);
-        return TRUE;
-    }
-
-    if (SetBatteryStateFromStatus(result, statusA) || SetBatteryStateFromStatus(result, statusB)) {
-        result->confidence = BATTERY_CONFIDENCE_COARSE;
-        return TRUE;
-    }
-
-    ZeroMemory(result, sizeof(*result));
-    return FALSE;
-}
-
-static BOOL QueryHidpp10Battery(HidppIo *io, const HidCandidate *device, BYTE deviceIndex, BatteryResult *result)
-{
-    BYTE response[HID_IO_BUFFER_LEN];
-
-    if (!Hidpp10ReadRegister(io, deviceIndex, HIDPP10_BATTERY_REGISTER, response)) {
-        return FALSE;
-    }
-
-    return ParseHidpp10Battery(result, device, deviceIndex, response);
-}
-
-static BOOL QueryBatteryFeature(HidppIo *io, const HidCandidate *device, BYTE deviceIndex, BatteryResult *result)
-{
-    BYTE featureIndex;
-    BYTE response[HID_IO_BUFFER_LEN];
-    BYTE emptyParams[3] = {0, 0, 0};
-
-    if (HidppGetFeatureIndex(io, deviceIndex, 0x1004, &featureIndex) &&
-        HidppCall(io, deviceIndex, featureIndex, 0x01, emptyParams, response) &&
-        ParsePercentBattery(result, device, deviceIndex, 0x1004, L"Unified battery", response)) {
-        return TRUE;
-    }
-
-    if (HidppGetFeatureIndex(io, deviceIndex, 0x1000, &featureIndex) &&
-        HidppCall(io, deviceIndex, featureIndex, 0x00, emptyParams, response) &&
-        ParsePercentBattery(result, device, deviceIndex, 0x1000, L"Battery status", response)) {
-        return TRUE;
-    }
-
-    if (HidppGetFeatureIndex(io, deviceIndex, 0x1001, &featureIndex) &&
-        HidppCall(io, deviceIndex, featureIndex, 0x00, emptyParams, response) &&
-        ParseVoltageBattery(result, device, deviceIndex, response)) {
-        return TRUE;
-    }
-
-    if (QueryHidpp10Battery(io, device, deviceIndex, result)) {
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-static int BuildDeviceIndexList(TransportKind transport, BYTE *indexes, int maxIndexes)
-{
-    static const BYTE receiverIndexes[] = {1, 2, 3, 4, 5, 6};
-    static const BYTE wiredIndexes[] = {0xFF, 0x00, 0x01};
-    static const BYTE unknownIndexes[] = {0xFF, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
-    const BYTE *source = unknownIndexes;
-    int count = (int)ARRAY_LEN(unknownIndexes);
-
-    if (transport == TRANSPORT_RECEIVER) {
-        source = receiverIndexes;
-        count = (int)ARRAY_LEN(receiverIndexes);
-    } else if (transport == TRANSPORT_WIRED) {
-        source = wiredIndexes;
-        count = (int)ARRAY_LEN(wiredIndexes);
-    }
-
-    if (count > maxIndexes) {
-        count = maxIndexes;
-    }
-
-    for (int i = 0; i < count; ++i) {
-        indexes[i] = source[i];
-    }
-
+    free(list);
     return count;
 }
 
-static BOOL ProbeDevice(const HidCandidate *device, ProbeResult *probe)
+static BOOL ArmPipe(HidPipe *pipe)
 {
-    HidppIo io;
-    BYTE indexes[8];
-    int indexCount;
+    ZeroMemory(&pipe->overlapped, sizeof(pipe->overlapped));
+    pipe->overlapped.hEvent = pipe->event;
+    pipe->pending = ReadFile(pipe->handle, pipe->report, pipe->reportBytes, NULL, &pipe->overlapped) ||
+        GetLastError() == ERROR_IO_PENDING;
+    return pipe->pending;
+}
 
-    ZeroMemory(probe, sizeof(*probe));
-    if (!device->likelyHidpp || !OpenHidppIo(device, &io)) {
+static void ClosePipe(HidPipe *pipe)
+{
+    DWORD bytes;
+
+    if (pipe->notify) {
+        UnregisterDeviceNotification(pipe->notify);
+    }
+    if (pipe->pending) {
+        CancelIoEx(pipe->handle, &pipe->overlapped);
+        (void)GetOverlappedResult(pipe->handle, &pipe->overlapped, &bytes, TRUE);
+    }
+    if (pipe->handle) {
+        CloseHandle(pipe->handle);
+    }
+    if (pipe->event) {
+        CloseHandle(pipe->event);
+    }
+    ZeroMemory(pipe, sizeof(*pipe));
+}
+
+static BOOL OpenPipe(HidPipe *pipe, const WCHAR *path, DWORD access, DWORD reportBytes)
+{
+    HANDLE handle = CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+
+    if (handle == INVALID_HANDLE_VALUE) {
         return FALSE;
     }
 
-    probe->opened = TRUE;
-    indexCount = BuildDeviceIndexList(device->transport, indexes, (int)ARRAY_LEN(indexes));
-    for (int i = 0; i < indexCount; ++i) {
-        BYTE featureIndex;
-        BYTE hidpp10Response[HID_IO_BUFFER_LEN];
-        BYTE deviceIndex = indexes[i];
+    pipe->handle = handle;
+    pipe->event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    pipe->reportBytes = reportBytes;
+    if (g_trayWindow) {
+        /* The tray holds devices open, so it must let go when Device Manager wants to disable or update one. */
+        DEV_BROADCAST_HANDLE filter;
 
-        if (HidppGetFeatureIndex(&io, deviceIndex, 0x1004, &featureIndex)) {
-            probe->hidpp = TRUE;
-            probe->deviceIndex = deviceIndex;
-            probe->hasBatteryFeature = TRUE;
-            (void)StringCchCopyW(probe->featureName, ARRAY_LEN(probe->featureName), L"Unified battery");
-        } else if (HidppGetFeatureIndex(&io, deviceIndex, 0x1000, &featureIndex)) {
-            probe->hidpp = TRUE;
-            probe->deviceIndex = deviceIndex;
-            probe->hasBatteryFeature = TRUE;
-            (void)StringCchCopyW(probe->featureName, ARRAY_LEN(probe->featureName), L"Battery status");
-        } else if (HidppGetFeatureIndex(&io, deviceIndex, 0x1001, &featureIndex)) {
-            probe->hidpp = TRUE;
-            probe->deviceIndex = deviceIndex;
-            probe->hasBatteryFeature = TRUE;
-            (void)StringCchCopyW(probe->featureName, ARRAY_LEN(probe->featureName), L"Battery voltage");
-        } else if (Hidpp10ReadRegister(&io, deviceIndex, HIDPP10_BATTERY_REGISTER, hidpp10Response)) {
-            probe->hidpp = TRUE;
-            probe->deviceIndex = deviceIndex;
-            probe->hasBatteryFeature = TRUE;
-            (void)StringCchCopyW(probe->featureName, ARRAY_LEN(probe->featureName), L"HID++ 1.0 battery register");
-        } else if (HidppGetFeatureIndex(&io, deviceIndex, HIDPP_FEATURE_FEATURE_SET, &featureIndex) ||
-                   HidppGetFeatureIndex(&io, deviceIndex, HIDPP_FEATURE_DEVICE_NAME_TYPE, &featureIndex) ||
-                   HidppGetFeatureIndex(&io, deviceIndex, HIDPP_FEATURE_ADJUSTABLE_DPI, &featureIndex) ||
-                   HidppGetFeatureIndex(&io, deviceIndex, HIDPP_FEATURE_ONBOARD_PROFILES, &featureIndex)) {
-            probe->hidpp = TRUE;
-            probe->deviceIndex = deviceIndex;
-        } else {
-            continue;
-        }
-
-        CloseHidppIo(&io);
+        ZeroMemory(&filter, sizeof(filter));
+        filter.dbch_size = sizeof(filter);
+        filter.dbch_devicetype = DBT_DEVTYP_HANDLE;
+        filter.dbch_handle = handle;
+        pipe->notify = RegisterDeviceNotificationW(g_trayWindow, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+    }
+    if (pipe->event && ArmPipe(pipe)) {
         return TRUE;
     }
 
-    CloseHidppIo(&io);
-    return TRUE;
-}
-
-static BOOL QueryDeviceSnapshot(const HidCandidate *device, DeviceSnapshot *snapshot)
-{
-    HidppIo io;
-    BYTE indexes[8];
-    int indexCount;
-
-    ZeroMemory(snapshot, sizeof(*snapshot));
-
-    if (!device->likelyHidpp || !OpenHidppIo(device, &io)) {
-        return FALSE;
-    }
-
-    indexCount = BuildDeviceIndexList(device->transport, indexes, (int)ARRAY_LEN(indexes));
-    for (int i = 0; i < indexCount; ++i) {
-        if (QueryBatteryFeature(&io, device, indexes[i], &snapshot->battery)) {
-            snapshot->device = *device;
-            QueryDeviceDetails(&io, indexes[i], &snapshot->details);
-            CloseHidppIo(&io);
-            return TRUE;
-        }
-    }
-
-    CloseHidppIo(&io);
+    ClosePipe(pipe);
     return FALSE;
 }
 
-static int BatteryResultScore(const BatteryResult *result)
+static BOOL CompletePipeRead(HidppPort *port, HidPipe *pipe, DWORD *bytes)
 {
-    int score = 0;
-
-    if (!result->found) {
-        return 0;
+    pipe->pending = FALSE;
+    if (GetOverlappedResult(pipe->handle, &pipe->overlapped, bytes, FALSE)) {
+        return TRUE;
     }
 
-    switch (result->confidence) {
-    case BATTERY_CONFIDENCE_PERCENT:
-        score += 300;
-        break;
-    case BATTERY_CONFIDENCE_COARSE:
-        score += 200;
-        break;
-    case BATTERY_CONFIDENCE_VOLTAGE:
-        score += 100;
-        break;
-    default:
-        break;
-    }
-
-    if (result->transport == TRANSPORT_WIRED) {
-        score += 50;
-    }
-    if (result->charging) {
-        score += 25;
-    }
-
-    return score;
+    port->dead = TRUE;
+    return FALSE;
 }
 
-static BOOL QueryBestSnapshot(DeviceSnapshot *snapshot)
+static void RearmPipe(HidppPort *port, HidPipe *pipe)
 {
-    HidCandidate *devices = NULL;
-    HidCandidate cachedDevice;
-    int count;
-    DeviceSnapshot bestAny;
-    DeviceSnapshot bestWired;
-    int bestAnyScore = 0;
-    int bestWiredScore = 0;
-
-    ZeroMemory(snapshot, sizeof(*snapshot));
-    ZeroMemory(&bestAny, sizeof(bestAny));
-    ZeroMemory(&bestWired, sizeof(bestWired));
-    if (!AcquireHidQueryLock()) {
-        return FALSE;
+    if (!ArmPipe(pipe)) {
+        port->dead = TRUE;
     }
-
-    if (CopyCachedDevice(&cachedDevice)) {
-        if (QueryDeviceSnapshot(&cachedDevice, snapshot)) {
-            ReleaseHidQueryLock();
-            return TRUE;
-        }
-        InvalidateDeviceCache();
-    }
-
-    devices = (HidCandidate *)calloc(MAX_HID_DEVICES, sizeof(*devices));
-    if (!devices) {
-        ReleaseHidQueryLock();
-        return FALSE;
-    }
-
-    count = EnumerateLogitechHidDevices(devices, MAX_HID_DEVICES);
-    for (int i = 0; i < count; ++i) {
-        DeviceSnapshot current;
-        int score;
-
-        ZeroMemory(&current, sizeof(current));
-        if (!QueryDeviceSnapshot(&devices[i], &current)) {
-            continue;
-        }
-
-        score = BatteryResultScore(&current.battery);
-        if (score > bestAnyScore) {
-            bestAny = current;
-            bestAnyScore = score;
-        }
-        if (current.battery.transport == TRANSPORT_WIRED && score > bestWiredScore) {
-            bestWired = current;
-            bestWiredScore = score;
-        }
-    }
-
-    if (bestWiredScore > 0) {
-        *snapshot = bestWired;
-    } else if (bestAnyScore > 0) {
-        *snapshot = bestAny;
-    } else {
-        InvalidateDeviceCache();
-        free(devices);
-        ReleaseHidQueryLock();
-        return FALSE;
-    }
-
-    StoreCachedDevice(&snapshot->device);
-    free(devices);
-    ReleaseHidQueryLock();
-    return TRUE;
 }
 
-static void DescribeBattery(const BatteryResult *result, WCHAR *buffer, size_t bufferChars)
+/* If another port still reaches the device (cable and receiver at once), read it there instead of leaving it offline. */
+static void ScheduleReadElsewhere(const Device *device, const HidppPort *closing)
 {
-    if (!result->found) {
-        (void)StringCchCopyW(buffer, bufferChars, L"Battery: unavailable");
+    for (int i = 0; i < MAX_PORTS; ++i) {
+        HidppPort *other = &g_ports[i];
+
+        for (int slot = 0; other != closing && other->used && slot < HIDPP_SLOTS; ++slot) {
+            if (other->slots[slot].state == SLOT_READY && other->slots[slot].device == device) {
+                other->readSlots |= (BYTE)(1u << slot);
+            }
+        }
+    }
+}
+
+static void ClosePort(HidppPort *port)
+{
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        if (g_devices[i].port == port) {
+            g_devices[i].port = NULL;
+            g_devices[i].online = FALSE;
+            ScheduleReadElsewhere(&g_devices[i], port);
+        }
+    }
+
+    ClosePipe(&port->longPipe);
+    ClosePipe(&port->shortPipe);
+    if (port->writeEvent) {
+        CloseHandle(port->writeEvent);
+    }
+    ZeroMemory(port, sizeof(*port));
+    g_trayDirty = TRUE;
+}
+
+static void CloseDeadPorts(void)
+{
+    for (int i = 0; i < MAX_PORTS; ++i) {
+        if (g_ports[i].used && g_ports[i].dead) {
+            ClosePort(&g_ports[i]);
+        }
+    }
+}
+
+static void CloseAllPorts(void)
+{
+    for (int i = 0; i < MAX_PORTS; ++i) {
+        if (g_ports[i].used) {
+            ClosePort(&g_ports[i]);
+        }
+    }
+}
+
+static void ClosePortWithHandle(HANDLE handle)
+{
+    for (int i = 0; i < MAX_PORTS; ++i) {
+        if (g_ports[i].used && (g_ports[i].longPipe.handle == handle || g_ports[i].shortPipe.handle == handle)) {
+            ClosePort(&g_ports[i]);
+        }
+    }
+}
+
+static void OpenCandidate(const HidCandidate *candidate)
+{
+    BOOL longReports = candidate->inputReportBytes == HIDPP_LONG_LEN;
+    HidppPort *port = NULL;
+    HidppPort *spare = NULL;
+    HidPipe *pipe;
+
+    for (int i = 0; i < MAX_PORTS && !port; ++i) {
+        if (g_ports[i].used && !g_ports[i].dead && g_ports[i].parent == candidate->parent) {
+            port = &g_ports[i];
+        } else if (!g_ports[i].used && !spare) {
+            spare = &g_ports[i];
+        }
+    }
+
+    if (!port) {
+        if (!spare) {
+            return;
+        }
+        port = spare;
+        port->writeEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!port->writeEvent) {
+            return;
+        }
+        port->used = TRUE;
+        port->parent = candidate->parent;
+        port->pid = candidate->pid;
+        (void)StringCchCopyW(port->product, ARRAY_LEN(port->product), candidate->product);
+    }
+
+    pipe = longReports ? &port->longPipe : &port->shortPipe;
+    if (pipe->handle) {
+        return;
+    }
+    if (!OpenPipe(pipe, candidate->path, longReports ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ, candidate->inputReportBytes)) {
+        if (!port->longPipe.handle && !port->shortPipe.handle) {
+            port->dead = TRUE;
+        }
         return;
     }
 
-    if (result->confidence == BATTERY_CONFIDENCE_PERCENT) {
-        if (result->state[0]) {
-            (void)StringCchPrintfW(buffer, bufferChars, L"Battery: %d%% (%s)", result->percent, result->state);
-        } else {
-            (void)StringCchPrintfW(buffer, bufferChars, L"Battery: %d%%", result->percent);
+    if (longReports) {
+        port->pendingSlots = HIDPP_ALL_SLOTS;
+    }
+}
+
+static void ScanPorts(void)
+{
+    HidCandidate candidates[MAX_CANDIDATES];
+    int count = EnumerateHidppCandidates(candidates, MAX_CANDIDATES);
+
+    for (int i = 0; i < count; ++i) {
+        OpenCandidate(&candidates[i]);
+    }
+}
+
+/* The two battery features number their charging states differently. */
+static const WCHAR *BatteryStateText(USHORT featureId, BYTE status, BOOL *charging)
+{
+    static const WCHAR *const unified[] = {L"Discharging", L"Charging", L"Charging slowly", L"Full", L"Charging error"};
+    static const WCHAR *const legacy[] = {
+        L"Discharging", L"Charging", L"Charging", L"Full", L"Charging slowly", L"Invalid battery", L"Thermal error"};
+
+    if (featureId == HIDPP_FEATURE_UNIFIED_BATTERY) {
+        *charging = status == 1 || status == 2;
+        return status < ARRAY_LEN(unified) ? unified[status] : L"";
+    }
+    *charging = status == 1 || status == 2 || status == 4;
+    return status < ARRAY_LEN(legacy) ? legacy[status] : L"";
+}
+
+/* Status replies and battery events share one layout: percentage in byte 4, charging state in byte 6. */
+static void ApplyBattery(Device *device, USHORT featureId, const BYTE *report)
+{
+    if (report[4] > 100) {
+        return;
+    }
+
+    device->percent = report[4];
+    device->state = BatteryStateText(featureId, report[6], &device->charging);
+    device->batteryKnown = TRUE;
+    g_trayDirty = TRUE;
+}
+
+static void LinkDevice(Device *device, HidppPort *port, BYTE index)
+{
+    if (device->port != port || device->index != index || !device->online) {
+        device->port = port;
+        device->index = index;
+        device->online = TRUE;
+        g_trayDirty = TRUE;
+    }
+}
+
+/* The device whose current connection is this port and index, if any. */
+static Device *DeviceAt(const HidppPort *port, BYTE index)
+{
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        if (g_devices[i].used && g_devices[i].port == port && g_devices[i].index == index) {
+            return &g_devices[i];
         }
-    } else if (result->confidence == BATTERY_CONFIDENCE_COARSE) {
-        (void)StringCchPrintfW(buffer, bufferChars, L"Battery: %s", result->state[0] ? result->state : L"coarse state");
-    } else if (result->confidence == BATTERY_CONFIDENCE_VOLTAGE) {
-        if (result->state[0] && wcscmp(result->state, L"Voltage only") != 0) {
-            (void)StringCchPrintfW(buffer, bufferChars, L"Battery: %d mV (%s)", result->millivolts, result->state);
+    }
+    return NULL;
+}
+
+static void MarkOffline(const HidppPort *port, BYTE index)
+{
+    Device *device = DeviceAt(port, index);
+
+    if (device && device->online) {
+        device->online = FALSE;
+        g_trayDirty = TRUE;
+    }
+}
+
+/* Only valid while the device is connected (device->port is set). */
+static DeviceSlot *SlotOf(const Device *device)
+{
+    return &device->port->slots[SlotForIndex(device->index)];
+}
+
+static void HandleReport(HidppPort *port, const BYTE *report, DWORD bytes)
+{
+    int slot = bytes >= HIDPP_SHORT_LEN ? SlotForIndex(report[1]) : -1;
+    BYTE bit;
+    DeviceSlot *s;
+
+    if (slot < 0) {
+        return;
+    }
+    bit = (BYTE)(1u << slot);
+    s = &port->slots[slot];
+
+    if (report[0] == HIDPP_REPORT_SHORT && report[2] == HIDPP10_CONNECTION) {
+        if (report[4] & HIDPP10_LINK_DOWN) {
+            MarkOffline(port, report[1]);
+        } else if (s->state == SLOT_READY) {
+            LinkDevice(s->device, port, report[1]);
+            port->readSlots |= bit;
         } else {
-            (void)StringCchPrintfW(buffer, bufferChars, L"Battery: %d mV", result->millivolts);
+            port->pendingSlots |= bit;
         }
+        return;
+    }
+
+    if (report[0] != HIDPP_REPORT_LONG || bytes != HIDPP_LONG_LEN) {
+        return;
+    }
+
+    if (s->state == SLOT_UNKNOWN) {
+        /* Any traffic, including a reply that arrived after its timeout, means the device is awake now. */
+        port->pendingSlots |= bit;
+    } else if (s->state == SLOT_READY && report[2] == s->batteryFeature && report[3] == 0) {
+        LinkDevice(s->device, port, report[1]);
+        ApplyBattery(s->device, s->batteryFeatureId, report);
+    }
+}
+
+static HidppStatus HidppRequest(
+    HidppPort *port,
+    BYTE index,
+    BYTE feature,
+    BYTE function,
+    BYTE param0,
+    BYTE param1,
+    BYTE reply[HIDPP_LONG_LEN])
+{
+    BYTE request[HIDPP_LONG_LEN] = {0};
+    OVERLAPPED write;
+    DWORD bytes = 0;
+    ULONGLONG deadline;
+
+    if (port->dead || !port->longPipe.handle) {
+        return HIDPP_FAILED;
+    }
+
+    request[0] = HIDPP_REPORT_LONG;
+    request[1] = index;
+    request[2] = feature;
+    request[3] = (BYTE)((function << 4) | g_swId);
+    request[4] = param0;
+    request[5] = param1;
+
+    ZeroMemory(&write, sizeof(write));
+    write.hEvent = port->writeEvent;
+    if (!WriteFile(port->longPipe.handle, request, sizeof(request), NULL, &write) && GetLastError() != ERROR_IO_PENDING) {
+        return HIDPP_FAILED;
+    }
+    if (WaitForSingleObject(port->writeEvent, g_replyTimeoutMs) != WAIT_OBJECT_0) {
+        CancelIoEx(port->longPipe.handle, &write);
+        (void)GetOverlappedResult(port->longPipe.handle, &write, &bytes, TRUE);
+        return HIDPP_FAILED;
+    }
+    if (!GetOverlappedResult(port->longPipe.handle, &write, &bytes, FALSE)) {
+        return HIDPP_FAILED;
+    }
+
+    /* Replies come back on the long collection; receivers report errors for missing devices on the short one. */
+    deadline = GetTickCount64() + g_replyTimeoutMs;
+    for (;;) {
+        HidPipe *pipes[2];
+        HANDLE events[2];
+        DWORD count = 0;
+        ULONGLONG now = GetTickCount64();
+        DWORD wait;
+        HidPipe *pipe;
+        const BYTE *report;
+
+        if (port->longPipe.pending) {
+            pipes[count] = &port->longPipe;
+            events[count++] = port->longPipe.event;
+        }
+        if (port->shortPipe.pending) {
+            pipes[count] = &port->shortPipe;
+            events[count++] = port->shortPipe.event;
+        }
+        if (count == 0 || now >= deadline) {
+            return HIDPP_FAILED;
+        }
+
+        wait = WaitForMultipleObjects(count, events, FALSE, (DWORD)(deadline - now));
+        if (wait >= WAIT_OBJECT_0 + count) {
+            return HIDPP_FAILED;
+        }
+
+        pipe = pipes[wait - WAIT_OBJECT_0];
+        if (!CompletePipeRead(port, pipe, &bytes)) {
+            return HIDPP_FAILED;
+        }
+
+        report = pipe->report;
+        if (bytes >= HIDPP_SHORT_LEN && report[1] == index) {
+            if (report[0] == HIDPP_REPORT_LONG && bytes == HIDPP_LONG_LEN && report[2] == feature && report[3] == request[3]) {
+                CopyMemory(reply, report, HIDPP_LONG_LEN);
+                RearmPipe(port, pipe);
+                return HIDPP_OK;
+            }
+            if ((report[2] == HIDPP20_ERROR || report[2] == HIDPP10_ERROR) && report[3] == feature && report[4] == request[3]) {
+                /* A receiver error means the device is not there; a device error (busy, ...) is only a failed request. */
+                RearmPipe(port, pipe);
+                return report[2] == HIDPP10_ERROR ? HIDPP_REJECTED : HIDPP_FAILED;
+            }
+        }
+
+        HandleReport(port, report, bytes);
+        RearmPipe(port, pipe);
+    }
+}
+
+/* Looks up a feature with the root feature's getFeature. HIDPP_OK with *feature == 0 means the device lacks it. */
+static HidppStatus HidppFeatureIndex(HidppPort *port, BYTE index, USHORT featureId, BYTE *feature)
+{
+    BYTE reply[HIDPP_LONG_LEN];
+    HidppStatus status = HidppRequest(port, index, 0x00, 0x00, (BYTE)(featureId >> 8), (BYTE)featureId, reply);
+
+    *feature = 0;
+    if (status == HIDPP_OK && reply[4] != 0xFF) {
+        *feature = reply[4];
+    }
+    return status;
+}
+
+/* HIDPP_REJECTED: the device has no usable name. Anything short of the full name fails, because a partial
+   name would become a second entry for the same device. */
+static HidppStatus ReadFirmwareName(HidppPort *port, BYTE index, WCHAR *name, int nameChars)
+{
+    BYTE feature;
+    BYTE reply[HIDPP_LONG_LEN];
+    int length;
+    int copied = 0;
+
+    if (HidppFeatureIndex(port, index, HIDPP_FEATURE_DEVICE_NAME, &feature) != HIDPP_OK) {
+        return HIDPP_FAILED;
+    }
+    if (!feature) {
+        return HIDPP_REJECTED;
+    }
+    /* getDeviceNameCount */
+    if (HidppRequest(port, index, feature, 0x00, 0, 0, reply) != HIDPP_OK) {
+        return HIDPP_FAILED;
+    }
+
+    length = reply[4];
+    if (length <= 0 || length >= nameChars) {
+        return HIDPP_REJECTED;
+    }
+
+    while (copied < length) {
+        int chunkStart = copied;
+
+        /* getDeviceName returns up to 16 characters from the given offset. */
+        if (HidppRequest(port, index, feature, 0x01, (BYTE)copied, 0, reply) != HIDPP_OK) {
+            return HIDPP_FAILED;
+        }
+        for (int i = 4; i < HIDPP_LONG_LEN && copied < length && reply[i]; ++i) {
+            name[copied++] = IsPrintableAscii(reply[i]) ? (WCHAR)reply[i] : L'?';
+        }
+        if (copied == chunkStart) {
+            /* The name ended early; the device over-reported its length. */
+            break;
+        }
+    }
+
+    name[copied] = L'\0';
+    return copied > 0 ? HIDPP_OK : HIDPP_REJECTED;
+}
+
+static Device *DeviceForName(const WCHAR *name)
+{
+    Device *spare = NULL;
+
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        if (g_devices[i].used && wcscmp(g_devices[i].name, name) == 0) {
+            return &g_devices[i];
+        }
+        if (!g_devices[i].used && !spare) {
+            spare = &g_devices[i];
+        }
+    }
+
+    if (spare) {
+        ZeroMemory(spare, sizeof(*spare));
+        spare->used = TRUE;
+        spare->state = L"";
+        (void)StringCchCopyW(spare->name, ARRAY_LEN(spare->name), name);
+    }
+    return spare;
+}
+
+static HidppStatus ReadSlotBattery(HidppPort *port, int slot)
+{
+    const DeviceSlot *s = &port->slots[slot];
+    BYTE index = IndexForSlot(slot);
+    BYTE reply[HIDPP_LONG_LEN];
+    HidppStatus status;
+
+    if (s->state != SLOT_READY) {
+        return HIDPP_FAILED;
+    }
+
+    /* getStatus is function 1 of Unified Battery and function 0 (getBatteryLevelStatus) of Battery Status. */
+    status = HidppRequest(port, index, s->batteryFeature, s->batteryFeatureId == HIDPP_FEATURE_UNIFIED_BATTERY ? 0x01 : 0x00, 0, 0, reply);
+    if (status == HIDPP_OK) {
+        LinkDevice(s->device, port, index);
+        ApplyBattery(s->device, s->batteryFeatureId, reply);
+    } else if (status == HIDPP_REJECTED) {
+        /* The receiver answers for a device that is asleep or switched off. */
+        MarkOffline(port, index);
+    }
+    return status;
+}
+
+static HidppStatus ReadBattery(Device *device)
+{
+    return device->port ? ReadSlotBattery(device->port, SlotForIndex(device->index)) : HIDPP_FAILED;
+}
+
+static void IdentifySlot(HidppPort *port, int slot)
+{
+    DeviceSlot *s = &port->slots[slot];
+    BYTE index = IndexForSlot(slot);
+    USHORT featureId = HIDPP_FEATURE_UNIFIED_BATTERY;
+    BYTE feature;
+    BYTE reply[HIDPP_LONG_LEN];
+    WCHAR name[DEVICE_NAME_MAX];
+    HidppStatus status = HidppFeatureIndex(port, index, featureId, &feature);
+    Device *device;
+    Device *previous;
+
+    /* Unified Battery only counts when it reports a percentage (getCapabilities flag bit 1), not just coarse levels. */
+    if (status == HIDPP_OK && feature) {
+        status = HidppRequest(port, index, feature, 0x00, 0, 0, reply);
+        if (status == HIDPP_OK && !(reply[5] & 0x02)) {
+            feature = 0;
+        }
+    }
+    if (status == HIDPP_OK && !feature) {
+        featureId = HIDPP_FEATURE_BATTERY_STATUS;
+        status = HidppFeatureIndex(port, index, featureId, &feature);
+    }
+    if (status == HIDPP_OK && feature) {
+        status = ReadFirmwareName(port, index, name, ARRAY_LEN(name));
+        if (status == HIDPP_REJECTED) {
+            /* No name feature: the HID product string is the best key left. */
+            (void)StringCchCopyW(name, ARRAY_LEN(name), DisplayStringOrFallback(port->product, L"Logitech device"));
+            status = HIDPP_OK;
+        }
+    }
+
+    if (status == HIDPP_FAILED) {
+        /* No answer: keep what is known and try again on the device's next traffic. */
+        if (s->state != SLOT_READY) {
+            s->state = SLOT_UNKNOWN;
+        }
+        return;
+    }
+    if (status == HIDPP_REJECTED || !feature) {
+        MarkOffline(port, index);
+        s->state = SLOT_ABSENT;
+        return;
+    }
+
+    device = DeviceForName(name);
+    if (!device) {
+        s->state = SLOT_ABSENT;
+        return;
+    }
+
+    previous = DeviceAt(port, index);
+    if (previous && previous != device) {
+        /* The slot now holds a different device, so the old entry is no longer reachable here. */
+        previous->port = NULL;
+        previous->online = FALSE;
+    }
+
+    ZeroMemory(s, sizeof(*s));
+    s->state = SLOT_READY;
+    s->batteryFeature = feature;
+    s->batteryFeatureId = featureId;
+    s->device = device;
+    LinkDevice(device, port, index);
+    (void)ReadSlotBattery(port, slot);
+}
+
+/* Runs the identifications and battery reads that reports and port changes have queued for this port. */
+static void ProcessPortWork(HidppPort *port)
+{
+    BOOL progress = TRUE;
+
+    while (progress && !port->dead && port->longPipe.handle) {
+        progress = FALSE;
+        for (int slot = 0; slot < HIDPP_SLOTS && !port->dead; ++slot) {
+            BYTE bit = (BYTE)(1u << slot);
+
+            /* Receiver slots need the short collection, or every missing device costs a full timeout. */
+            if ((port->pendingSlots & bit) && (slot == 0 || port->shortPipe.handle)) {
+                port->pendingSlots &= (BYTE)~bit;
+                progress = TRUE;
+                if (slot > 0 && port->slots[0].state == SLOT_READY) {
+                    continue;
+                }
+
+                IdentifySlot(port, slot);
+                if (port->slots[slot].state == SLOT_READY) {
+                    /* Identification just read the battery; traffic seen meanwhile needs no second pass. */
+                    port->pendingSlots &= (BYTE)~bit;
+                    port->readSlots &= (BYTE)~bit;
+                }
+                if (slot == 0 && port->slots[0].state == SLOT_READY) {
+                    /* A directly connected device answers on every index. */
+                    for (int other = 1; other < HIDPP_SLOTS; ++other) {
+                        port->slots[other].state = SLOT_ABSENT;
+                    }
+                }
+            } else if (port->readSlots & bit) {
+                port->readSlots &= (BYTE)~bit;
+                progress = TRUE;
+                (void)ReadSlotBattery(port, slot);
+            }
+        }
+    }
+}
+
+static void ProcessAllPorts(void)
+{
+    for (int i = 0; i < MAX_PORTS; ++i) {
+        if (g_ports[i].used) {
+            ProcessPortWork(&g_ports[i]);
+        }
+    }
+}
+
+static void IdentifyAllPorts(void)
+{
+    ScanPorts();
+    ProcessAllPorts();
+}
+
+static void ReadDpiRange(const BYTE *reply, DpiInfo *dpi)
+{
+    dpi->minDpi = 0;
+    dpi->maxDpi = 0;
+    for (int i = 5; i + 1 < HIDPP_LONG_LEN; i += 2) {
+        int value = ReadBe16(&reply[i]);
+
+        if (value == 0) {
+            break;
+        }
+        if (value > 0xE000) {
+            continue;
+        }
+        if (dpi->minDpi == 0 || value < dpi->minDpi) {
+            dpi->minDpi = value;
+        }
+        if (value > dpi->maxDpi) {
+            dpi->maxDpi = value;
+        }
+    }
+}
+
+static void ReadDeviceDetails(Device *device)
+{
+    HidppPort *port = device->port;
+    BYTE index = device->index;
+    BYTE reply[HIDPP_LONG_LEN];
+    DeviceSlot *s;
+
+    device->dpi.found = FALSE;
+    device->profile.found = FALSE;
+    device->profile.rawIndex = -1;
+    device->profile.currentDpiIndex = -1;
+    if (!port || !device->online) {
+        return;
+    }
+
+    /* Each step stops at the first failure so an unresponsive device costs one timeout, not five. */
+    s = SlotOf(device);
+    if (!s->detailFeaturesKnown) {
+        if (HidppFeatureIndex(port, index, HIDPP_FEATURE_ADJUSTABLE_DPI, &s->dpiFeature) != HIDPP_OK ||
+            HidppFeatureIndex(port, index, HIDPP_FEATURE_ONBOARD_PROFILES, &s->profileFeature) != HIDPP_OK) {
+            return;
+        }
+        /* getSensorDpiList (function 1) gives the range; it is read once per connection. */
+        if (s->dpiFeature) {
+            if (HidppRequest(port, index, s->dpiFeature, 0x01, 0, 0, reply) != HIDPP_OK) {
+                return;
+            }
+            ReadDpiRange(reply, &device->dpi);
+        }
+        s->detailFeaturesKnown = TRUE;
+    }
+
+    /* getSensorDpi (function 2) for sensor 0. */
+    if (s->dpiFeature) {
+        if (HidppRequest(port, index, s->dpiFeature, 0x02, 0, 0, reply) != HIDPP_OK) {
+            return;
+        }
+        device->dpi.currentDpi = ReadBe16(&reply[5]);
+        device->dpi.found = device->dpi.currentDpi > 0;
+    }
+
+    /* Onboard profiles: getCurrentProfile (function 4) and getCurrentDpiIndex (function 11). */
+    if (s->profileFeature) {
+        if (HidppRequest(port, index, s->profileFeature, 0x04, 0, 0, reply) != HIDPP_OK) {
+            return;
+        }
+        device->profile.rawIndex = reply[5];
+        device->profile.found = TRUE;
+        if (HidppRequest(port, index, s->profileFeature, 0x0B, 0, 0, reply) == HIDPP_OK) {
+            device->profile.currentDpiIndex = reply[4];
+        }
+    }
+}
+
+static const WCHAR *BatterySourceName(USHORT featureId)
+{
+    return featureId == HIDPP_FEATURE_UNIFIED_BATTERY ? L"Unified battery" : L"Battery status";
+}
+
+static void DescribeBattery(const Device *device, WCHAR *buffer, size_t bufferChars)
+{
+    if (!device->batteryKnown) {
+        (void)StringCchCopyW(buffer, bufferChars, L"Battery: unknown");
+    } else if (!device->online) {
+        (void)StringCchPrintfW(buffer, bufferChars, L"Battery: %d%% (offline)", device->percent);
+    } else if (device->state[0]) {
+        (void)StringCchPrintfW(buffer, bufferChars, L"Battery: %d%% (%s)", device->percent, device->state);
     } else {
-        (void)StringCchCopyW(buffer, bufferChars, L"Battery: unavailable");
+        (void)StringCchPrintfW(buffer, bufferChars, L"Battery: %d%%", device->percent);
     }
 }
 
 static int PrintListDevices(void)
 {
-    HidCandidate *devices = (HidCandidate *)calloc(MAX_HID_DEVICES, sizeof(*devices));
-    int count;
-    int shown = 0;
+    HidCandidate candidates[MAX_CANDIDATES];
+    int count = EnumerateHidppCandidates(candidates, MAX_CANDIDATES);
 
-    if (!devices) {
-        wprintf(L"Could not allocate the HID device list.\n");
-        return 1;
-    }
-
-    count = EnumerateLogitechHidDevices(devices, MAX_HID_DEVICES);
     if (count == 0) {
-        wprintf(L"No Logitech HID devices found.\n");
-        free(devices);
+        wprintf(L"No Logitech HID++ collections found.\n");
         return 1;
     }
 
-    wprintf(L"Logitech HID candidates (no serials or USB instance IDs are shown):\n");
+    wprintf(L"Logitech HID++ collections (no serials or USB instance IDs are shown):\n");
     for (int i = 0; i < count; ++i) {
-        const HidCandidate *device = &devices[i];
-        if (!device->likelyHidpp && !device->vendorDefined) {
-            continue;
-        }
+        const HidCandidate *candidate = &candidates[i];
 
-        ++shown;
         wprintf(
-            L"  %d. %s | %s | VID_%04X PID_%04X | usage 0x%04X/0x%04X | reports in/out/feature %u/%u/%u | HID++ candidate: %s\n",
-            shown,
-            TransportName(device->transport),
-            DisplayStringOrFallback(device->product, L"Logitech HID device"),
-            device->vid,
-            device->pid,
-            device->usagePage,
-            device->usage,
-            device->inputReportBytes,
-            device->outputReportBytes,
-            device->featureReportBytes,
-            device->likelyHidpp ? L"yes" : L"no");
+            L"  %d. %s | VID_%04X PID_%04X | usage 0x%04X/0x%04X | reports in/out %u/%u | HID++ %s\n",
+            i + 1,
+            DisplayStringOrFallback(candidate->product, L"Logitech HID device"),
+            LOGITECH_VID,
+            candidate->pid,
+            HIDPP_USAGE_PAGE,
+            candidate->usage,
+            candidate->inputReportBytes,
+            candidate->outputReportBytes,
+            candidate->inputReportBytes == HIDPP_LONG_LEN ? L"long" : L"short");
     }
 
-    if (shown == 0) {
-        wprintf(L"No likely Logitech HID++ candidates found.\n");
-        free(devices);
-        return 1;
-    }
-
-    free(devices);
     return 0;
 }
 
 static int PrintProbe(void)
 {
-    HidCandidate *devices = (HidCandidate *)calloc(MAX_HID_DEVICES, sizeof(*devices));
-    int count;
-    int probed = 0;
+    int ports = 0;
 
-    if (!devices) {
-        wprintf(L"Could not allocate the HID device list.\n");
-        return 1;
-    }
-
-    count = EnumerateLogitechHidDevices(devices, MAX_HID_DEVICES);
-    if (count == 0) {
-        wprintf(L"No Logitech HID devices found.\n");
-        free(devices);
-        return 1;
-    }
-
-    if (!AcquireHidQueryLock()) {
-        wprintf(L"Could not acquire HID query lock.\n");
-        free(devices);
-        return 1;
-    }
-
+    IdentifyAllPorts();
     wprintf(L"HID++ probe results:\n");
-    for (int i = 0; i < count; ++i) {
-        ProbeResult probe;
-        const HidCandidate *device = &devices[i];
+    for (int i = 0; i < MAX_PORTS; ++i) {
+        const HidppPort *port = &g_ports[i];
+        int ready = 0;
 
-        if (!device->likelyHidpp) {
+        if (!port->used || !port->longPipe.handle) {
             continue;
         }
 
-        ++probed;
-        (void)ProbeDevice(device, &probe);
+        ++ports;
         wprintf(
-            L"  %s | %s | VID_%04X PID_%04X | open: %s | HID++: %s",
-            TransportName(device->transport),
-            DisplayStringOrFallback(device->product, L"Logitech HID device"),
-            device->vid,
-            device->pid,
-            probe.opened ? L"yes" : L"no",
-            probe.hidpp ? L"yes" : L"no");
+            L"  %s | VID_%04X PID_%04X | short collection: %s\n",
+            DisplayStringOrFallback(port->product, L"Logitech HID device"),
+            LOGITECH_VID,
+            port->pid,
+            port->shortPipe.handle ? L"yes" : L"no");
 
-        if (probe.hidpp) {
-            wprintf(L" | device index: 0x%02X", probe.deviceIndex);
+        for (int slot = 0; slot < HIDPP_SLOTS; ++slot) {
+            const DeviceSlot *s = &port->slots[slot];
+
+            if (s->state != SLOT_READY) {
+                continue;
+            }
+            ++ready;
+            wprintf(
+                L"    device index 0x%02X | %s | battery feature: %s 0x%04X\n",
+                IndexForSlot(slot),
+                s->device->name,
+                BatterySourceName(s->batteryFeatureId),
+                s->batteryFeatureId);
         }
-        if (probe.hasBatteryFeature) {
-            wprintf(L" | battery feature: %s", probe.featureName);
+        if (ready == 0) {
+            wprintf(L"    no device with a battery feature answered\n");
         }
-        wprintf(L"\n");
     }
 
-    if (probed == 0) {
-        wprintf(L"No likely Logitech HID++ candidates found.\n");
-        ReleaseHidQueryLock();
-        free(devices);
-        return 1;
+    if (ports == 0) {
+        wprintf(L"No Logitech HID++ collections found.\n");
     }
-
-    ReleaseHidQueryLock();
-    free(devices);
-    return 0;
+    CloseAllPorts();
+    return ports ? 0 : 1;
 }
 
 static void JsonPrintWString(const WCHAR *value)
@@ -1536,46 +1098,6 @@ static void JsonPrintWString(const WCHAR *value)
     putchar('"');
 }
 
-static void JsonPrintAString(const char *value)
-{
-    putchar('"');
-    for (const char *p = value ? value : ""; *p; ++p) {
-        unsigned char ch = (unsigned char)*p;
-
-        switch (ch) {
-        case '"':
-            printf("\\\"");
-            break;
-        case '\\':
-            printf("\\\\");
-            break;
-        case '\b':
-            printf("\\b");
-            break;
-        case '\f':
-            printf("\\f");
-            break;
-        case '\n':
-            printf("\\n");
-            break;
-        case '\r':
-            printf("\\r");
-            break;
-        case '\t':
-            printf("\\t");
-            break;
-        default:
-            if (ch < 0x20 || ch > 0x7E) {
-                printf("\\u%04X", (unsigned int)ch);
-            } else {
-                putchar((char)ch);
-            }
-            break;
-        }
-    }
-    putchar('"');
-}
-
 static void PrintJsonNullableInt(const char *name, int value)
 {
     printf("\"%s\": ", name);
@@ -1586,94 +1108,100 @@ static void PrintJsonNullableInt(const char *name, int value)
     }
 }
 
-static int PrintOnce(void)
+static void PrintDeviceJson(const Device *device)
 {
-    DeviceSnapshot snapshot;
-    const BatteryResult *battery = &snapshot.battery;
-    const DeviceDetails *details = &snapshot.details;
-    const WCHAR *displayName;
+    const DeviceSlot *s = SlotOf(device);
 
-    if (!QueryBestSnapshot(&snapshot)) {
-        printf("{\"error\":\"no_supported_device\"}\n");
-        return 1;
-    }
-
-    displayName = details->firmwareNameFound
-        ? details->firmwareName
-        : DisplayStringOrFallback(snapshot.device.product, L"Logitech HID device");
-
-    printf("{\n");
-    printf("  \"battery\": {\n");
-    if (battery->confidence == BATTERY_CONFIDENCE_PERCENT) {
-        printf("    \"percent\": %d,\n", battery->percent);
+    printf("    {\n");
+    printf("      \"battery\": {\n");
+    if (device->batteryKnown) {
+        printf("        \"percent\": %d,\n", device->percent);
     } else {
-        printf("    \"percent\": null,\n");
+        printf("        \"percent\": null,\n");
     }
-    printf("    \"state\": ");
-    JsonPrintWString(battery->state[0] ? battery->state : L"Unknown");
+    printf("        \"state\": ");
+    JsonPrintWString(device->state[0] ? device->state : L"Unknown");
     printf(",\n");
-    printf("    \"charging\": %s,\n", battery->charging ? "true" : "false");
-    printf("    \"source\": ");
-    JsonPrintWString(battery->source);
-    printf("\n");
-    printf("  },\n");
+    printf("        \"charging\": %s,\n", device->charging ? "true" : "false");
+    printf("        \"source\": \"%ls 0x%04X\"\n", BatterySourceName(s->batteryFeatureId), s->batteryFeatureId);
+    printf("      },\n");
 
-    printf("  \"device\": {\n");
-    printf("    \"name\": ");
-    JsonPrintWString(displayName);
+    printf("      \"device\": {\n");
+    printf("        \"name\": ");
+    JsonPrintWString(device->name);
     printf(",\n");
-    printf("    \"hid_product\": ");
-    JsonPrintWString(DisplayStringOrFallback(snapshot.device.product, L"Logitech HID device"));
+    printf("        \"hid_product\": ");
+    JsonPrintWString(DisplayStringOrFallback(device->port->product, L"Logitech HID device"));
     printf(",\n");
-    printf("    \"transport\": ");
-    JsonPrintWString(TransportName(battery->transport));
-    printf(",\n");
-    printf("    \"vid\": \"VID_%04X\",\n", battery->vid);
-    printf("    \"pid\": \"PID_%04X\",\n", battery->pid);
-    printf("    \"hidpp_device_index\": \"0x%02X\"\n", battery->deviceIndex);
-    printf("  },\n");
+    printf("        \"transport\": \"%s\",\n", device->index == HIDPP_DIRECT_INDEX ? "wired" : "receiver");
+    printf("        \"vid\": \"VID_%04X\",\n", LOGITECH_VID);
+    printf("        \"pid\": \"PID_%04X\",\n", device->port->pid);
+    printf("        \"hidpp_device_index\": \"0x%02X\"\n", device->index);
+    printf("      },\n");
 
-    printf("  \"dpi\": ");
-    if (details->dpi.found) {
+    printf("      \"dpi\": ");
+    if (device->dpi.found) {
         printf("{\n");
-        printf("    \"current\": %d,\n", details->dpi.currentDpi);
-        printf("    ");
-        PrintJsonNullableInt("min", details->dpi.minDpi > 0 ? details->dpi.minDpi : -1);
+        printf("        \"current\": %d,\n", device->dpi.currentDpi);
+        printf("        ");
+        PrintJsonNullableInt("min", device->dpi.minDpi > 0 ? device->dpi.minDpi : -1);
         printf(",\n");
-        printf("    ");
-        PrintJsonNullableInt("max", details->dpi.maxDpi > 0 ? details->dpi.maxDpi : -1);
+        printf("        ");
+        PrintJsonNullableInt("max", device->dpi.maxDpi > 0 ? device->dpi.maxDpi : -1);
         printf("\n");
-        printf("  },\n");
+        printf("      },\n");
     } else {
         printf("null,\n");
     }
 
-    printf("  \"profile\": ");
-    if (details->profile.found) {
+    printf("      \"profile\": ");
+    if (device->profile.found) {
         printf("{\n");
-        printf("    ");
-        PrintJsonNullableInt("index", details->profile.rawIndex);
+        printf("        ");
+        PrintJsonNullableInt("index", device->profile.rawIndex);
         printf(",\n");
-        printf("    ");
-        PrintJsonNullableInt("dpi_slot", details->profile.currentDpiIndex);
+        printf("        ");
+        PrintJsonNullableInt("dpi_slot", device->profile.currentDpiIndex);
         printf("\n");
-        printf("  }\n");
+        printf("      }\n");
     } else {
         printf("null\n");
     }
+    printf("    }");
+}
 
-    printf("}\n");
-    return 0;
+static int PrintOnce(void)
+{
+    int printed = 0;
+
+    IdentifyAllPorts();
+    printf("{\n  \"devices\": [");
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        Device *device = &g_devices[i];
+
+        if (!device->used || !device->online) {
+            continue;
+        }
+
+        ReadDeviceDetails(device);
+        printf(printed ? ",\n" : "\n");
+        PrintDeviceJson(device);
+        ++printed;
+    }
+    printf(printed ? "\n  ]\n}\n" : "]\n}\n");
+
+    CloseAllPorts();
+    return printed ? 0 : 1;
 }
 
 static void PrintHelp(const WCHAR *exeName)
 {
     wprintf(L"Usage: %s [--list-devices | --probe | --once | --tray]\n", exeName);
     wprintf(L"\n");
-    wprintf(L"  --list-devices  List generic Logitech HID++ candidates without private IDs.\n");
-    wprintf(L"  --probe         Probe HID++ communication and battery feature support.\n");
-    wprintf(L"  --once          Print one JSON device snapshot and exit.\n");
-    wprintf(L"  --tray          Run the on-demand tray indicator. This is the default.\n");
+    wprintf(L"  --list-devices  List Logitech HID++ collections without private IDs.\n");
+    wprintf(L"  --probe         Probe HID++ devices and their battery feature.\n");
+    wprintf(L"  --once          Print one JSON snapshot of every device and exit.\n");
+    wprintf(L"  --tray          Run the tray indicator. This is the default.\n");
 }
 
 static const WCHAR *BasenameOfPath(const WCHAR *path)
@@ -1692,451 +1220,278 @@ static const WCHAR *BasenameOfPath(const WCHAR *path)
     return base;
 }
 
-static NOTIFYICONDATAW g_tray = {0};
-static DeviceSnapshot g_traySnapshot = {0};
-static DeviceSnapshot g_refreshSnapshot = {0};
-static BOOL g_traySnapshotValid = FALSE;
 static HICON g_trayIcon = NULL;
-static int g_trayIconPercent = -2;
-static BOOL g_trayIconCharging = FALSE;
-static int g_trayIconSize = 0;
-static BOOL g_trayIconAdded = FALSE;
 static UINT g_taskbarCreatedMessage = 0;
-static ULONGLONG g_lastHoverRefreshTick = 0;
-static volatile LONG g_refreshInProgress = 0;
 static HDEVNOTIFY g_hidDeviceNotify = NULL;
 
-static void AddTrayIcon(HWND hwnd);
+#define ICON_MAX_SIZE 64
 
-typedef struct IconPixel {
-    BYTE r;
-    BYTE g;
-    BYTE b;
-    BYTE a;
-} IconPixel;
+typedef struct IconTheme {
+    DWORD ink;
+    DWORD high;
+    DWORD mid;
+    DWORD low;
+    DWORD charging;
+} IconTheme;
 
-static const IconPixel ICON_CLEAR = {0, 0, 0, 0};
-static const IconPixel ICON_INK = {14, 15, 18, 255};
-static const IconPixel ICON_EMPTY = {245, 246, 248, 255};
-static const IconPixel ICON_UNKNOWN = {165, 174, 185, 255};
-static const IconPixel ICON_HIGH = {31, 191, 107, 255};
-static const IconPixel ICON_MID = {231, 178, 58, 255};
-static const IconPixel ICON_LOW = {226, 90, 58, 255};
+/* Windows 11 system colours: ink is the outline in the taskbar's text colour. */
+static const IconTheme ICON_THEME_DARK = {0xFFFFFF, 0x6CCB5F, 0xFCE100, 0xFF99A4, 0x60CDFF};
+static const IconTheme ICON_THEME_LIGHT = {0x1A1A1A, 0x0F7B0F, 0x9D5D00, 0xC42B1C, 0x005FB7};
 
-static DWORD PremultipliedArgb(IconPixel pixel)
+static float Clamp01(float value)
 {
-    BYTE b = (BYTE)((pixel.b * pixel.a + 127) / 255);
-    BYTE g = (BYTE)((pixel.g * pixel.a + 127) / 255);
-    BYTE r = (BYTE)((pixel.r * pixel.a + 127) / 255);
-
-    return ((DWORD)pixel.a << 24) | ((DWORD)r << 16) | ((DWORD)g << 8) | b;
+    return value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
 }
 
-static IconPixel BatteryLevelColor(int percent)
+static void ColorChannels(DWORD color, float rgb[3])
 {
-    if (percent >= 60) {
-        return ICON_HIGH;
-    }
-    if (percent >= 25) {
-        return ICON_MID;
-    }
-    return ICON_LOW;
+    rgb[0] = ((color >> 16) & 0xFF) / 255.0f;
+    rgb[1] = ((color >> 8) & 0xFF) / 255.0f;
+    rgb[2] = (color & 0xFF) / 255.0f;
 }
 
-static void FillIconRect16(IconPixel pixels[16 * 16], int left, int top, int width, int height, IconPixel color)
+static void BlendOver(float pixel[4], const float rgb[3], float alpha)
 {
-    for (int y = top; y < top + height; ++y) {
-        if (y < 0 || y >= 16) {
-            continue;
-        }
+    float keep = pixel[3] * (1.0f - alpha);
+    float outAlpha = alpha + keep;
 
-        for (int x = left; x < left + width; ++x) {
-            if (x < 0 || x >= 16) {
-                continue;
+    if (outAlpha <= 0.0f) {
+        return;
+    }
+    for (int i = 0; i < 3; ++i) {
+        pixel[i] = (rgb[i] * alpha + pixel[i] * keep) / outAlpha;
+    }
+    pixel[3] = outAlpha;
+}
+
+/* Antialiased coverage of pixel (x, y) by a rounded rectangle, from its signed distance. */
+static float RoundedRectCoverage(int x, int y, float left, float top, float right, float bottom, float radius)
+{
+    float halfWidth = (right - left) * 0.5f;
+    float halfHeight = (bottom - top) * 0.5f;
+    float dx = fabsf(x + 0.5f - (left + halfWidth)) - (halfWidth - radius);
+    float dy = fabsf(y + 0.5f - (top + halfHeight)) - (halfHeight - radius);
+    float outsideX = fmaxf(dx, 0.0f);
+    float outsideY = fmaxf(dy, 0.0f);
+
+    return Clamp01(0.5f - (sqrtf(outsideX * outsideX + outsideY * outsideY) + fminf(fmaxf(dx, dy), 0.0f) - radius));
+}
+
+static void RenderBatteryIcon(DWORD *pixels, int size, int percent, BOOL charging, BOOL lightTaskbar)
+{
+    const IconTheme *theme = lightTaskbar ? &ICON_THEME_LIGHT : &ICON_THEME_DARK;
+    /* A standing battery on whole pixels keeps the edges sharp; only the corners are antialiased. */
+    int stroke = max(1, size / 16);
+    int bodyWidth = (size * 10 + 8) / 16;
+    int left = (size - bodyWidth) / 2;
+    int right = left + bodyWidth;
+    int capWidth = bodyWidth * 2 / 5;
+    int capLeft = left + (bodyWidth - capWidth) / 2;
+    int bodyTop = 2 * stroke;
+    int fillLeft = left + 2 * stroke;
+    int fillRight = right - 2 * stroke;
+    int fillBottom = size - 2 * stroke;
+    int fillTop = fillBottom - ((fillBottom - bodyTop - 2 * stroke) * max(percent, 0) + 50) / 100;
+    float radius = 2.0f * stroke;
+    float ink[3];
+    float fill[3];
+
+    if (percent > 0 && fillTop == fillBottom) {
+        --fillTop;
+    }
+    ColorChannels(theme->ink, ink);
+    ColorChannels(charging ? theme->charging : (percent > 50 ? theme->high : (percent > 20 ? theme->mid : theme->low)), fill);
+
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            float pixel[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float body = RoundedRectCoverage(x, y, (float)left, (float)bodyTop, (float)right, (float)size, radius);
+            float inner = RoundedRectCoverage(x, y, (float)(left + stroke), (float)(bodyTop + stroke), (float)(right - stroke), (float)(size - stroke), radius - stroke);
+            BYTE alpha;
+
+            BlendOver(pixel, ink, Clamp01(body - inner));
+            if (y >= stroke && y < bodyTop && x >= capLeft && x < capLeft + capWidth) {
+                BlendOver(pixel, ink, 1.0f);
+            }
+            if (percent >= 0 && x >= fillLeft && x < fillRight && y >= fillTop && y < fillBottom) {
+                BlendOver(pixel, fill, 1.0f);
             }
 
-            pixels[y * 16 + x] = color;
+            alpha = (BYTE)(pixel[3] * 255.0f + 0.5f);
+            pixels[y * size + x] = ((DWORD)alpha << 24) |
+                ((DWORD)(pixel[0] * alpha + 0.5f) << 16) |
+                ((DWORD)(pixel[1] * alpha + 0.5f) << 8) |
+                (DWORD)(pixel[2] * alpha + 0.5f);
         }
     }
 }
 
-static void RenderBatteryIcon16(IconPixel pixels[16 * 16], int percent, BOOL charging)
+static HICON CreateBatteryTrayIcon(int size, int percent, BOOL charging, BOOL lightTaskbar)
 {
-    for (int i = 0; i < 16 * 16; ++i) {
-        pixels[i] = ICON_CLEAR;
-    }
-
-    FillIconRect16(pixels, 6, 1, 4, 1, ICON_INK);
-    FillIconRect16(pixels, 3, 2, 10, 13, ICON_INK);
-    FillIconRect16(pixels, 4, 3, 8, 11, ICON_EMPTY);
-
-    if (charging) {
-        FillIconRect16(pixels, 4, 3, 8, 11, ICON_HIGH);
-        FillIconRect16(pixels, 8, 4, 2, 1, ICON_INK);
-        FillIconRect16(pixels, 7, 5, 2, 1, ICON_INK);
-        FillIconRect16(pixels, 7, 6, 1, 1, ICON_INK);
-        FillIconRect16(pixels, 6, 7, 4, 1, ICON_INK);
-        FillIconRect16(pixels, 8, 8, 1, 1, ICON_INK);
-        FillIconRect16(pixels, 7, 9, 1, 1, ICON_INK);
-        FillIconRect16(pixels, 7, 10, 1, 1, ICON_INK);
-        FillIconRect16(pixels, 6, 11, 1, 1, ICON_INK);
-    } else if (percent >= 0) {
-        int fillHeight = (percent * 11 + 50) / 100;
-
-        if (fillHeight > 11) {
-            fillHeight = 11;
-        }
-        if (percent > 0 && fillHeight < 1) {
-            fillHeight = 1;
-        }
-        if (fillHeight > 0) {
-            FillIconRect16(pixels, 4, 14 - fillHeight, 8, fillHeight, BatteryLevelColor(percent));
-        }
-    } else {
-        FillIconRect16(pixels, 4, 3, 8, 11, ICON_UNKNOWN);
-    }
-}
-
-static HICON CreateBatteryTrayIcon(int targetSize)
-{
+    static BYTE zeroMask[ICON_MAX_SIZE * ICON_MAX_SIZE / 8];
     BITMAPINFO bmi;
     void *bits = NULL;
-    HDC screenDc = NULL;
-    HBITMAP colorBitmap = NULL;
-    HBITMAP maskBitmap = NULL;
-    HICON icon = NULL;
+    HBITMAP colorBitmap;
+    HBITMAP maskBitmap;
     ICONINFO iconInfo;
-    BYTE *maskBits = NULL;
-    DWORD *targetPixels;
-    int maskRowBytes;
-    int percent = -1;
-    BOOL charging = FALSE;
-    IconPixel sourcePixels[16 * 16];
+    HICON icon = NULL;
 
-    if (targetSize <= 0 || targetSize > 256) {
-        return NULL;
-    }
-
-    maskRowBytes = ((targetSize + 31) / 32) * 4;
-
-    if (g_traySnapshotValid) {
-        charging = g_traySnapshot.battery.charging;
-        if (g_traySnapshot.battery.confidence == BATTERY_CONFIDENCE_PERCENT) {
-            percent = g_traySnapshot.battery.percent;
-        }
-    }
-
-    maskBits = (BYTE *)calloc((size_t)maskRowBytes * (size_t)targetSize, 1);
-    if (!maskBits) {
-        return NULL;
-    }
-
-    RenderBatteryIcon16(sourcePixels, percent, charging);
+    size = max(16, min(size, ICON_MAX_SIZE));
 
     ZeroMemory(&bmi, sizeof(bmi));
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = targetSize;
-    bmi.bmiHeader.biHeight = -targetSize;
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = -size;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    screenDc = GetDC(NULL);
-    if (!screenDc) {
-        free(maskBits);
+    colorBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!colorBitmap) {
         return NULL;
     }
+    RenderBatteryIcon((DWORD *)bits, size, percent, charging, lightTaskbar);
 
-    colorBitmap = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-    ReleaseDC(NULL, screenDc);
-    if (!colorBitmap || !bits) {
-        if (colorBitmap) {
-            DeleteObject(colorBitmap);
-        }
-        free(maskBits);
-        return NULL;
+    maskBitmap = CreateBitmap(size, size, 1, 1, zeroMask);
+    if (maskBitmap) {
+        ZeroMemory(&iconInfo, sizeof(iconInfo));
+        iconInfo.fIcon = TRUE;
+        iconInfo.hbmColor = colorBitmap;
+        iconInfo.hbmMask = maskBitmap;
+        icon = CreateIconIndirect(&iconInfo);
+        DeleteObject(maskBitmap);
     }
 
-    targetPixels = (DWORD *)bits;
-    for (int y = 0; y < targetSize; ++y) {
-        int sourceY = (y * 16) / targetSize;
-
-        for (int x = 0; x < targetSize; ++x) {
-            int sourceX = (x * 16) / targetSize;
-
-            targetPixels[(size_t)y * targetSize + x] = PremultipliedArgb(sourcePixels[sourceY * 16 + sourceX]);
-        }
-    }
-
-    maskBitmap = CreateBitmap(targetSize, targetSize, 1, 1, maskBits);
-    free(maskBits);
-    if (!maskBitmap) {
-        DeleteObject(colorBitmap);
-        return NULL;
-    }
-
-    ZeroMemory(&iconInfo, sizeof(iconInfo));
-    iconInfo.fIcon = TRUE;
-    iconInfo.hbmColor = colorBitmap;
-    iconInfo.hbmMask = maskBitmap;
-    icon = CreateIconIndirect(&iconInfo);
-
-    DeleteObject(maskBitmap);
     DeleteObject(colorBitmap);
     return icon;
 }
 
-static int GetTrayIconSize(HWND hwnd)
+static BOOL TaskbarUsesLightTheme(void)
 {
-    static GetSystemMetricsForDpiFn pGetSystemMetricsForDpi = NULL;
-    static GetDpiForWindowFn pGetDpiForWindow = NULL;
-    static BOOL resolved = FALSE;
-    int size;
+    DWORD value = 0;
+    DWORD bytes = sizeof(value);
 
-    if (!resolved) {
-        HMODULE user32 = GetModuleHandleW(L"user32.dll");
-        if (user32) {
-            pGetSystemMetricsForDpi = (GetSystemMetricsForDpiFn)
-                GetProcAddress(user32, "GetSystemMetricsForDpi");
-            pGetDpiForWindow = (GetDpiForWindowFn)
-                GetProcAddress(user32, "GetDpiForWindow");
-        }
-        resolved = TRUE;
-    }
-
-    if (hwnd && pGetSystemMetricsForDpi && pGetDpiForWindow) {
-        UINT dpi = pGetDpiForWindow(hwnd);
-
-        if (dpi == 0) {
-            dpi = 96;
-        }
-        size = pGetSystemMetricsForDpi(SM_CXSMICON, dpi);
-        if (size > 0) {
-            return size;
-        }
-    }
-
-    size = GetSystemMetrics(SM_CXSMICON);
-    return size > 0 ? size : 16;
+    return RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"SystemUsesLightTheme",
+        RRF_RT_REG_DWORD,
+        NULL,
+        &value,
+        &bytes) == ERROR_SUCCESS && value != 0;
 }
 
-static void EnablePerMonitorDpiAwareness(void)
+/* The icon shows the lowest battery among connected devices, or the last known value when none is connected. */
+static const Device *IconDevice(void)
 {
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    SetProcessDpiAwarenessContextFn p = NULL;
+    const Device *best = NULL;
 
-    if (user32) {
-        p = (SetProcessDpiAwarenessContextFn)
-            GetProcAddress(user32, "SetProcessDpiAwarenessContext");
-    }
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        const Device *device = &g_devices[i];
 
-    if (p && p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
-        return;
-    }
-
-    if (user32) {
-        typedef BOOL (WINAPI *SetProcessDPIAwareFn)(void);
-        SetProcessDPIAwareFn legacy = (SetProcessDPIAwareFn)
-            GetProcAddress(user32, "SetProcessDPIAware");
-
-        if (legacy) {
-            legacy();
+        if (!device->used || !device->batteryKnown) {
+            continue;
+        }
+        if (!best || (device->online && !best->online) ||
+            (device->online == best->online && device->percent < best->percent)) {
+            best = device;
         }
     }
+
+    return best;
 }
 
-static const WCHAR *SnapshotDeviceName(const DeviceSnapshot *snapshot)
+static void DescribeTrayTip(WCHAR *tip, size_t tipChars)
 {
-    if (snapshot->details.firmwareNameFound) {
-        return snapshot->details.firmwareName;
-    }
+    tip[0] = L'\0';
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        const Device *device = &g_devices[i];
+        WCHAR line[96];
 
-    return DisplayStringOrFallback(snapshot->device.product, L"Logitech HID device");
-}
-
-static void DescribeTrayTip(WCHAR *buffer, size_t bufferChars)
-{
-    const BatteryResult *battery = &g_traySnapshot.battery;
-
-    if (!g_traySnapshotValid) {
-        (void)StringCchCopyW(buffer, bufferChars, L"SuperLightBattery: unavailable");
-        return;
-    }
-
-    if (battery->confidence == BATTERY_CONFIDENCE_PERCENT) {
-        if (g_traySnapshot.details.dpi.found) {
-            (void)StringCchPrintfW(
-                buffer,
-                bufferChars,
-                L"%s: %d%% %s, %d DPI",
-                SnapshotDeviceName(&g_traySnapshot),
-                battery->percent,
-                battery->state[0] ? battery->state : L"",
-                g_traySnapshot.details.dpi.currentDpi);
+        if (!device->used) {
+            continue;
+        }
+        if (!device->batteryKnown) {
+            (void)StringCchPrintfW(line, ARRAY_LEN(line), L"%s: unknown", device->name);
         } else {
             (void)StringCchPrintfW(
-                buffer,
-                bufferChars,
+                line,
+                ARRAY_LEN(line),
                 L"%s: %d%% %s",
-                SnapshotDeviceName(&g_traySnapshot),
-                battery->percent,
-                battery->state[0] ? battery->state : L"");
+                device->name,
+                device->percent,
+                device->online ? device->state : L"(offline)");
         }
-    } else {
-        WCHAR batteryLine[128];
-
-        DescribeBattery(battery, batteryLine, ARRAY_LEN(batteryLine));
-        (void)StringCchPrintfW(buffer, bufferChars, L"%s: %s", SnapshotDeviceName(&g_traySnapshot), batteryLine);
-    }
-}
-
-static void UpdateTrayTip(HWND hwnd)
-{
-    WCHAR tip[128];
-    HICON oldIcon = g_trayIcon;
-    int iconPercent = -1;
-    BOOL iconCharging = FALSE;
-    int iconSize = GetTrayIconSize(hwnd);
-    BOOL iconChanged;
-
-    if (!g_trayIconAdded) {
-        AddTrayIcon(hwnd);
-        return;
-    }
-
-    DescribeTrayTip(tip, ARRAY_LEN(tip));
-
-    if (g_traySnapshotValid) {
-        iconCharging = g_traySnapshot.battery.charging;
-        if (g_traySnapshot.battery.confidence == BATTERY_CONFIDENCE_PERCENT) {
-            iconPercent = g_traySnapshot.battery.percent;
+        /* The tooltip holds 127 characters; leave out whole lines rather than cut one off. */
+        if (wcslen(tip) + (tip[0] ? 1 : 0) + wcslen(line) >= tipChars) {
+            break;
         }
+        if (tip[0]) {
+            (void)StringCchCatW(tip, tipChars, L"\n");
+        }
+        (void)StringCchCatW(tip, tipChars, line);
     }
 
-    iconChanged = !g_trayIcon
-        || iconPercent != g_trayIconPercent
-        || iconCharging != g_trayIconCharging
-        || iconSize != g_trayIconSize;
-    if (iconChanged) {
-        g_trayIcon = CreateBatteryTrayIcon(iconSize);
-        g_trayIconPercent = iconPercent;
-        g_trayIconCharging = iconCharging;
-        g_trayIconSize = iconSize;
-    }
-
-    ZeroMemory(&g_tray, sizeof(g_tray));
-    g_tray.cbSize = sizeof(g_tray);
-    g_tray.hWnd = hwnd;
-    g_tray.uID = TRAY_UID;
-    g_tray.uFlags = NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
-    if (iconChanged) {
-        g_tray.uFlags |= NIF_ICON;
-    }
-    g_tray.uCallbackMessage = WM_TRAYICON;
-    g_tray.hIcon = g_trayIcon ? g_trayIcon : LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APPICON));
-    (void)StringCchCopyW(g_tray.szTip, ARRAY_LEN(g_tray.szTip), tip);
-    if (!Shell_NotifyIconW(NIM_MODIFY, &g_tray)) {
-        g_trayIconAdded = FALSE;
-    }
-    if (iconChanged && oldIcon) {
-        DestroyIcon(oldIcon);
+    if (!tip[0]) {
+        (void)StringCchCopyW(tip, tipChars, L"SuperLightBattery: no device");
     }
 }
 
-static DWORD WINAPI RefreshTrayBatteryWorker(void *context)
+static void InitTrayData(NOTIFYICONDATAW *tray, HWND hwnd)
 {
-    HWND hwnd = (HWND)context;
-    BOOL ok;
-
-    ZeroMemory(&g_refreshSnapshot, sizeof(g_refreshSnapshot));
-    ok = QueryBestSnapshot(&g_refreshSnapshot);
-
-    if (!PostMessageW(hwnd, WM_REFRESH_COMPLETE, ok ? 1 : 0, ok ? (LPARAM)&g_refreshSnapshot : 0)) {
-        InterlockedExchange(&g_refreshInProgress, 0);
-    }
-
-    return 0;
+    ZeroMemory(tray, sizeof(*tray));
+    tray->cbSize = sizeof(*tray);
+    tray->hWnd = hwnd;
+    tray->uID = TRAY_UID;
 }
 
-static void RequestTrayBatteryRefresh(HWND hwnd)
+static void UpdateTray(HWND hwnd)
 {
-    if (InterlockedCompareExchange(&g_refreshInProgress, 1, 0) != 0) {
-        return;
+    NOTIFYICONDATAW tray;
+    const Device *device = IconDevice();
+    int size = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(hwnd));
+    HICON icon = CreateBatteryTrayIcon(size, device ? device->percent : -1, device && device->charging, TaskbarUsesLightTheme());
+
+    InitTrayData(&tray, hwnd);
+    /* Without a new icon the shell keeps showing the previous one. */
+    tray.uFlags = NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | (icon ? NIF_ICON : 0);
+    tray.uCallbackMessage = WM_TRAYICON;
+    tray.hIcon = icon;
+    DescribeTrayTip(tray.szTip, ARRAY_LEN(tray.szTip));
+    if (!Shell_NotifyIconW(NIM_MODIFY, &tray) && Shell_NotifyIconW(NIM_ADD, &tray)) {
+        /* Version 4 sends WM_CONTEXTMENU, which also opens the menu from the keyboard; NIF_SHOWTIP keeps the tooltip. */
+        tray.uVersion = NOTIFYICON_VERSION_4;
+        (void)Shell_NotifyIconW(NIM_SETVERSION, &tray);
     }
 
-    if (!QueueUserWorkItem(RefreshTrayBatteryWorker, hwnd, WT_EXECUTEDEFAULT)) {
-        InterlockedExchange(&g_refreshInProgress, 0);
-    }
-}
-
-static void RequestTrayBatteryRefreshForHover(HWND hwnd)
-{
-    ULONGLONG now = GetTickCount64();
-
-    if (g_lastHoverRefreshTick != 0 && now - g_lastHoverRefreshTick < HOVER_REFRESH_COOLDOWN_MS) {
-        return;
-    }
-
-    g_lastHoverRefreshTick = now;
-    RequestTrayBatteryRefresh(hwnd);
-}
-
-static void AddTrayIcon(HWND hwnd)
-{
-    WCHAR tip[128];
-    HICON oldIcon = g_trayIcon;
-    int iconSize = GetTrayIconSize(hwnd);
-
-    g_trayIcon = CreateBatteryTrayIcon(iconSize);
-    g_trayIconSize = iconSize;
-    DescribeTrayTip(tip, ARRAY_LEN(tip));
-
-    ZeroMemory(&g_tray, sizeof(g_tray));
-    g_tray.cbSize = sizeof(g_tray);
-    g_tray.hWnd = hwnd;
-    g_tray.uID = TRAY_UID;
-    g_tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    g_tray.uCallbackMessage = WM_TRAYICON;
-    g_tray.hIcon = g_trayIcon ? g_trayIcon : LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APPICON));
-    (void)StringCchCopyW(g_tray.szTip, ARRAY_LEN(g_tray.szTip), tip);
-    if (Shell_NotifyIconW(NIM_ADD, &g_tray)) {
-        g_trayIconAdded = TRUE;
-        g_tray.uVersion = NOTIFYICON_VERSION_4;
-        (void)Shell_NotifyIconW(NIM_SETVERSION, &g_tray);
-    } else {
-        g_trayIconAdded = FALSE;
-    }
-
-    if (oldIcon) {
-        DestroyIcon(oldIcon);
+    if (icon) {
+        if (g_trayIcon) {
+            DestroyIcon(g_trayIcon);
+        }
+        g_trayIcon = icon;
     }
 }
 
-static void RemoveTrayIcon(void)
+static void RemoveTrayIcon(HWND hwnd)
 {
-    if (g_tray.cbSize != 0) {
-        (void)Shell_NotifyIconW(NIM_DELETE, &g_tray);
-    }
-    g_trayIconAdded = FALSE;
+    NOTIFYICONDATAW tray;
+
+    InitTrayData(&tray, hwnd);
+    (void)Shell_NotifyIconW(NIM_DELETE, &tray);
     if (g_trayIcon) {
         DestroyIcon(g_trayIcon);
         g_trayIcon = NULL;
     }
-    g_trayIconPercent = -2;
-    g_trayIconCharging = FALSE;
 }
 
 static void RegisterHidDeviceNotifications(HWND hwnd)
 {
     DEV_BROADCAST_DEVICEINTERFACE_W filter;
-    GUID hidGuid;
 
-    HidD_GetHidGuid(&hidGuid);
     ZeroMemory(&filter, sizeof(filter));
     filter.dbcc_size = sizeof(filter);
     filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-    filter.dbcc_classguid = hidGuid;
-
+    HidD_GetHidGuid(&filter.dbcc_classguid);
     g_hidDeviceNotify = RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
 }
 
@@ -2148,116 +1503,139 @@ static void UnregisterHidDeviceNotifications(void)
     }
 }
 
-static void ShowTrayMenu(HWND hwnd)
+static void RequestFullRefresh(void)
 {
-    HMENU menu = CreatePopupMenu();
-    POINT pt;
-    WCHAR batteryText[160];
-    WCHAR batteryLine[128];
-    WCHAR line[160];
+    for (int i = 0; i < MAX_PORTS; ++i) {
+        if (g_ports[i].used) {
+            g_ports[i].pendingSlots = HIDPP_ALL_SLOTS;
+        }
+    }
+    g_rescanPending = TRUE;
+}
 
+static void ShowTrayMenu(HWND hwnd, POINT anchor)
+{
+    HMENU menu;
+    WCHAR line[128];
+    BOOL any = FALSE;
+
+    /* The mouse is awake when it right-clicks; anything slower than this keeps its last values. */
+    g_replyTimeoutMs = HIDPP_MENU_TIMEOUT_MS;
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        if (g_devices[i].used && g_devices[i].online) {
+            if (ReadBattery(&g_devices[i]) == HIDPP_OK) {
+                ReadDeviceDetails(&g_devices[i]);
+            } else {
+                g_devices[i].dpi.found = FALSE;
+                g_devices[i].profile.found = FALSE;
+            }
+        }
+    }
+    g_replyTimeoutMs = HIDPP_REPLY_TIMEOUT_MS;
+
+    menu = CreatePopupMenu();
     if (!menu) {
         return;
     }
 
-    if (g_traySnapshotValid) {
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, SnapshotDeviceName(&g_traySnapshot));
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        const Device *device = &g_devices[i];
 
-        DescribeBattery(&g_traySnapshot.battery, batteryLine, ARRAY_LEN(batteryLine));
-        (void)StringCchPrintfW(batteryText, ARRAY_LEN(batteryText), L"%s", batteryLine);
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, TRAY_MENU_BATTERY, batteryText);
+        if (!device->used) {
+            continue;
+        }
+        if (any) {
+            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        }
+        any = TRUE;
 
-        if (g_traySnapshot.details.dpi.found) {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, device->name);
+        DescribeBattery(device, line, ARRAY_LEN(line));
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, line);
+
+        if (device->dpi.found && device->dpi.maxDpi > 0) {
             (void)StringCchPrintfW(
                 line,
                 ARRAY_LEN(line),
                 L"DPI: %d (%d-%d)",
-                g_traySnapshot.details.dpi.currentDpi,
-                g_traySnapshot.details.dpi.minDpi,
-                g_traySnapshot.details.dpi.maxDpi);
+                device->dpi.currentDpi,
+                device->dpi.minDpi,
+                device->dpi.maxDpi);
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, line);
+        } else if (device->dpi.found) {
+            (void)StringCchPrintfW(line, ARRAY_LEN(line), L"DPI: %d", device->dpi.currentDpi);
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, line);
         }
 
-        if (g_traySnapshot.details.profile.found) {
+        if (device->profile.found) {
             (void)StringCchPrintfW(
                 line,
                 ARRAY_LEN(line),
                 L"Profile: %d, DPI slot: %d",
-                g_traySnapshot.details.profile.rawIndex,
-                g_traySnapshot.details.profile.currentDpiIndex);
+                device->profile.rawIndex,
+                device->profile.currentDpiIndex);
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, line);
         }
-    } else {
-        AppendMenuW(
-            menu,
-            MF_STRING | MF_GRAYED,
-            TRAY_MENU_BATTERY,
-            g_refreshInProgress ? L"Battery: refreshing..." : L"Battery: unavailable");
+    }
+
+    if (!any) {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"Battery: unavailable");
     }
 
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, TRAY_MENU_REFRESH, L"Refresh");
     AppendMenuW(menu, MF_STRING, TRAY_MENU_EXIT, L"Exit");
 
-    GetCursorPos(&pt);
     SetForegroundWindow(hwnd);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, anchor.x, anchor.y, 0, hwnd, NULL);
     PostMessageW(hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
+}
+
+static void RunPendingWork(HWND hwnd)
+{
+    CloseDeadPorts();
+    if (g_rescanPending) {
+        g_rescanPending = FALSE;
+        ScanPorts();
+    }
+    ProcessAllPorts();
+    CloseDeadPorts();
+
+    if (g_trayDirty) {
+        g_trayDirty = FALSE;
+        UpdateTray(hwnd);
+    }
 }
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (g_taskbarCreatedMessage != 0 && msg == g_taskbarCreatedMessage) {
-        g_trayIconAdded = FALSE;
-        AddTrayIcon(hwnd);
+        g_trayDirty = TRUE;
         return 0;
     }
 
     switch (msg) {
     case WM_CREATE:
-        AddTrayIcon(hwnd);
+        g_trayWindow = hwnd;
         RegisterHidDeviceNotifications(hwnd);
-        RequestTrayBatteryRefresh(hwnd);
+        UpdateTray(hwnd);
+        g_rescanPending = TRUE;
         return 0;
-
-    case WM_REFRESH_COMPLETE:
-    {
-        DeviceSnapshot *snapshot = (DeviceSnapshot *)lParam;
-
-        if (wParam && snapshot) {
-            g_traySnapshot = *snapshot;
-            g_traySnapshotValid = TRUE;
-        } else {
-            ZeroMemory(&g_traySnapshot, sizeof(g_traySnapshot));
-            g_traySnapshotValid = FALSE;
-        }
-
-        InterlockedExchange(&g_refreshInProgress, 0);
-        UpdateTrayTip(hwnd);
-        return 0;
-    }
 
     case WM_TRAYICON:
-    {
-        UINT trayEvent = LOWORD(lParam);
+        if (LOWORD(lParam) == WM_CONTEXTMENU) {
+            /* wParam carries the click point, or the icon's position when opened from the keyboard. */
+            POINT anchor = {(short)LOWORD(wParam), (short)HIWORD(wParam)};
 
-        if (trayEvent == NIN_POPUPOPEN || trayEvent == WM_MOUSEMOVE) {
-            /* Some shells do not reliably send NIN_POPUPOPEN; the cooldown keeps mousemove cheap. */
-            RequestTrayBatteryRefreshForHover(hwnd);
-        } else if (trayEvent == WM_RBUTTONUP || trayEvent == WM_CONTEXTMENU) {
-            RequestTrayBatteryRefresh(hwnd);
-            ShowTrayMenu(hwnd);
-        } else if (trayEvent == WM_LBUTTONDBLCLK) {
-            RequestTrayBatteryRefresh(hwnd);
+            ShowTrayMenu(hwnd, anchor);
         }
         return 0;
-    }
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case TRAY_MENU_REFRESH:
-            RequestTrayBatteryRefresh(hwnd);
+            RequestFullRefresh();
             return 0;
         case TRAY_MENU_EXIT:
             DestroyWindow(hwnd);
@@ -2268,15 +1646,41 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         break;
 
     case WM_DEVICECHANGE:
-        if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE || wParam == DBT_DEVNODES_CHANGED) {
-            InvalidateDeviceCache();
-            RequestTrayBatteryRefresh(hwnd);
+        if (wParam == DBT_DEVICEARRIVAL) {
+            const DEV_BROADCAST_DEVICEINTERFACE_W *broadcast = (const DEV_BROADCAST_DEVICEINTERFACE_W *)lParam;
+
+            if (broadcast && broadcast->dbcc_devicetype == DBT_DEVTYP_DEVICEINTERFACE &&
+                ContainsNoCase(broadcast->dbcc_name, L"VID_046D")) {
+                g_rescanPending = TRUE;
+            }
+        } else if (wParam == DBT_DEVICEQUERYREMOVE) {
+            const DEV_BROADCAST_HANDLE *broadcast = (const DEV_BROADCAST_HANDLE *)lParam;
+
+            if (broadcast && broadcast->dbch_devicetype == DBT_DEVTYP_HANDLE) {
+                /* Release the device so it can be disabled or updated; look again later in case the removal is cancelled. */
+                ClosePortWithHandle(broadcast->dbch_handle);
+                SetTimer(hwnd, TRAY_RESCAN_TIMER, TRAY_RESCAN_DELAY_MS, NULL);
+            }
         }
+        break;
+
+    case WM_TIMER:
+        if (wParam == TRAY_RESCAN_TIMER) {
+            KillTimer(hwnd, TRAY_RESCAN_TIMER);
+            g_rescanPending = TRUE;
+        }
+        return 0;
+
+    case WM_SETTINGCHANGE:
+    case WM_DISPLAYCHANGE:
+    case WM_DPICHANGED:
+        /* Theme, scaling or display changes: redraw at the current size and colours. Redrawing is cheap and rare. */
+        g_trayDirty = TRUE;
         return 0;
 
     case WM_DESTROY:
         UnregisterHidDeviceNotifications();
-        RemoveTrayIcon();
+        RemoveTrayIcon(hwnd);
         PostQuitMessage(0);
         return 0;
 
@@ -2287,6 +1691,55 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+/* Sleeps until a window message arrives or a device sends a report; there is no polling. */
+static int RunTrayLoop(HWND hwnd)
+{
+    for (;;) {
+        HANDLE events[MAX_PORTS * 2];
+        HidppPort *ports[MAX_PORTS * 2];
+        HidPipe *pipes[MAX_PORTS * 2];
+        DWORD count = 0;
+        DWORD wait;
+
+        RunPendingWork(hwnd);
+        for (int i = 0; i < MAX_PORTS; ++i) {
+            HidPipe *portPipes[2] = {&g_ports[i].longPipe, &g_ports[i].shortPipe};
+
+            for (int j = 0; j < 2; ++j) {
+                if (g_ports[i].used && portPipes[j]->pending) {
+                    ports[count] = &g_ports[i];
+                    pipes[count] = portPipes[j];
+                    events[count++] = portPipes[j]->event;
+                }
+            }
+        }
+
+        wait = MsgWaitForMultipleObjectsEx(count, events, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (wait < WAIT_OBJECT_0 + count) {
+            HidppPort *port = ports[wait - WAIT_OBJECT_0];
+            HidPipe *pipe = pipes[wait - WAIT_OBJECT_0];
+            DWORD bytes;
+
+            if (CompletePipeRead(port, pipe, &bytes)) {
+                HandleReport(port, pipe->report, bytes);
+                RearmPipe(port, pipe);
+            }
+        } else if (wait == WAIT_OBJECT_0 + count) {
+            MSG msg;
+
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) {
+                    return (int)msg.wParam;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        } else {
+            return 1;
+        }
+    }
+}
+
 static int RunTray(HINSTANCE instance)
 {
     const WCHAR className[] = L"SuperLightBatteryTrayWindow";
@@ -2294,7 +1747,7 @@ static int RunTray(HINSTANCE instance)
     DWORD mutexStatus;
     WNDCLASSW wc;
     HWND hwnd;
-    MSG msg;
+    int result;
 
     mutex = CreateMutexW(NULL, TRUE, L"Local\\SuperLightBatteryTray");
     if (!mutex) {
@@ -2314,91 +1767,57 @@ static int RunTray(HINSTANCE instance)
         }
     }
 
-    EnablePerMonitorDpiAwareness();
+    g_swId = HIDPP_TRAY_SW_ID;
+    (void)SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = TrayWndProc;
     wc.hInstance = instance;
     wc.lpszClassName = className;
-    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APPICON));
 
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        fwprintf(stderr, L"Could not register tray window class.\n");
         CloseHandle(mutex);
         return 1;
     }
 
-    hwnd = CreateWindowExW(
-        0,
-        className,
-        L"SuperLightBattery",
-        0,
-        0,
-        0,
-        0,
-        0,
-        NULL,
-        NULL,
-        instance,
-        NULL);
-
+    hwnd = CreateWindowExW(0, className, L"SuperLightBattery", 0, 0, 0, 0, 0, NULL, NULL, instance, NULL);
     if (!hwnd) {
-        fwprintf(stderr, L"Could not create tray window.\n");
         CloseHandle(mutex);
         return 1;
     }
 
-    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-
+    result = RunTrayLoop(hwnd);
+    CloseAllPorts();
     CloseHandle(mutex);
-    return 0;
+    return result;
 }
 
 static int RunApp(int argc, WCHAR **argv)
 {
-    HINSTANCE instance = GetModuleHandleW(NULL);
-    int result;
-
     if (argc > 1) {
         if (wcscmp(argv[1], L"--list-devices") == 0) {
-            result = PrintListDevices();
-            CloseHidQueryLockHandle();
-            return result;
+            return PrintListDevices();
         }
         if (wcscmp(argv[1], L"--probe") == 0) {
-            result = PrintProbe();
-            CloseHidQueryLockHandle();
-            return result;
+            return PrintProbe();
         }
         if (wcscmp(argv[1], L"--once") == 0) {
-            result = PrintOnce();
-            CloseHidQueryLockHandle();
-            return result;
-        }
-        if (wcscmp(argv[1], L"--tray") == 0) {
-            FreeConsole();
-            result = RunTray(instance);
-            CloseHidQueryLockHandle();
-            return result;
+            return PrintOnce();
         }
         if (wcscmp(argv[1], L"--help") == 0 || wcscmp(argv[1], L"-h") == 0 || wcscmp(argv[1], L"/?") == 0) {
             PrintHelp(BasenameOfPath(argv[0]));
             return 0;
         }
-
-        fwprintf(stderr, L"Unknown option: %s\n\n", argv[1]);
-        PrintHelp(BasenameOfPath(argv[0]));
-        return 2;
+        if (wcscmp(argv[1], L"--tray") != 0) {
+            fwprintf(stderr, L"Unknown option: %s\n\n", argv[1]);
+            PrintHelp(BasenameOfPath(argv[0]));
+            return 2;
+        }
     }
 
     FreeConsole();
-    result = RunTray(instance);
-    CloseHidQueryLockHandle();
-    return result;
+    return RunTray(GetModuleHandleW(NULL));
 }
 
 int wmain(int argc, WCHAR **argv)

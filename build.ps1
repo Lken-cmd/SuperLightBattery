@@ -147,7 +147,7 @@ $appArgs = New-ClArgs `
     -Obj $AppObj `
     -Res $AppRes `
     -LinkArgs @("/SUBSYSTEM:CONSOLE") `
-    -Libs @("setupapi.lib", "hid.lib", "shell32.lib", "user32.lib", "gdi32.lib")
+    -Libs @("cfgmgr32.lib", "hid.lib", "shell32.lib", "user32.lib", "gdi32.lib", "advapi32.lib")
 
 $launcherArgs = New-ClArgs `
     -Source $LauncherSource `

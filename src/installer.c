@@ -24,13 +24,6 @@
 #define ID_BTN_UNINSTALL 1002
 #define ID_BTN_CLOSE     1003
 
-#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-typedef HANDLE DPI_AWARENESS_CONTEXT;
-#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
-#endif
-typedef BOOL (WINAPI *SetProcessDpiAwarenessContextFn)(DPI_AWARENESS_CONTEXT);
-typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
-
 typedef struct InstallerWindow {
     HWND hwnd;
     HWND title;
@@ -46,54 +39,6 @@ typedef struct InstallerWindow {
     UINT dpi;
     WCHAR installDir[MAX_PATH];
 } InstallerWindow;
-
-static void EnablePerMonitorDpiAwareness(void)
-{
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    SetProcessDpiAwarenessContextFn p = NULL;
-
-    if (user32) {
-        p = (SetProcessDpiAwarenessContextFn)
-            GetProcAddress(user32, "SetProcessDpiAwarenessContext");
-    }
-
-    if (p && p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
-        return;
-    }
-
-    if (user32) {
-        typedef BOOL (WINAPI *SetProcessDPIAwareFn)(void);
-        SetProcessDPIAwareFn legacy = (SetProcessDPIAwareFn)
-            GetProcAddress(user32, "SetProcessDPIAware");
-
-        if (legacy) {
-            legacy();
-        }
-    }
-}
-
-static UINT GetWindowDpiSafe(HWND hwnd)
-{
-    static GetDpiForWindowFn p = NULL;
-    static BOOL resolved = FALSE;
-
-    if (!resolved) {
-        HMODULE user32 = GetModuleHandleW(L"user32.dll");
-        if (user32) {
-            p = (GetDpiForWindowFn)GetProcAddress(user32, "GetDpiForWindow");
-        }
-        resolved = TRUE;
-    }
-
-    if (p && hwnd) {
-        UINT dpi = p(hwnd);
-        if (dpi > 0) {
-            return dpi;
-        }
-    }
-
-    return 96;
-}
 
 static int Scale(int value, UINT dpi)
 {
@@ -164,8 +109,19 @@ static void RequestTrayExit(void)
     }
 
     if (hwnd) {
+        DWORD processId = 0;
+        HANDLE process;
+
+        (void)GetWindowThreadProcessId(hwnd, &processId);
+        process = processId ? OpenProcess(SYNCHRONIZE, FALSE, processId) : NULL;
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
-        Sleep(400);
+        /* The tray may be in the middle of a device read that takes a few seconds; its files stay locked until it exits. */
+        if (process) {
+            (void)WaitForSingleObject(process, 10000);
+            CloseHandle(process);
+        } else {
+            Sleep(400);
+        }
     }
 }
 
@@ -672,7 +628,7 @@ static LRESULT CALLBACK InstallerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
     case WM_CREATE:
         win = (InstallerWindow *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         win->hwnd = hwnd;
-        win->dpi = GetWindowDpiSafe(hwnd);
+        win->dpi = GetDpiForWindow(hwnd);
         CreateControls(win, ((CREATESTRUCTW *)lParam)->hInstance);
         CreateFontsForDpi(win);
         ApplyFonts(win);
@@ -764,8 +720,6 @@ static int RunInstallerGui(HINSTANCE instance)
     UINT dpi;
     int windowW;
     int windowH;
-
-    EnablePerMonitorDpiAwareness();
 
     ZeroMemory(&icc, sizeof(icc));
     icc.dwSize = sizeof(icc);

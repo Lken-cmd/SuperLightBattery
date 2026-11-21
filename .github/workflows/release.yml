@@ -53,7 +53,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $tag = $env:GITHUB_REF_NAME
+          $flags = @()
+          if ($tag -like "*-*") {
+            $flags += "--prerelease"
+          }
           gh release create $tag `
             "dist/SuperLightBattery-$tag-win-x64.zip" `
             --title $tag `
-            --notes-file "dist/release-notes.md"
+            --notes-file "dist/release-notes.md" `
+            @flags

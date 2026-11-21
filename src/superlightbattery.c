@@ -17,6 +17,7 @@
 
 #define LOGITECH_VID 0x046D
 #define HIDPP_USAGE_PAGE 0xFF00
+#define HIDPP_USAGE_PAGE_ALT 0xFF43
 #define HIDPP_REPORT_SHORT 0x10
 #define HIDPP_REPORT_LONG 0x11
 #define HIDPP_SHORT_LEN 7
@@ -72,6 +73,7 @@ typedef struct HidCandidate {
     WCHAR product[PRODUCT_NAME_MAX];
     DEVINST parent;
     USHORT pid;
+    USHORT usagePage;
     USHORT usage;
     USHORT inputReportBytes;
     USHORT outputReportBytes;
@@ -215,7 +217,8 @@ static BOOL ReadCandidate(HidCandidate *candidate)
     ok = HidD_GetAttributes(handle, &attributes) && attributes.VendorID == LOGITECH_VID &&
         HidD_GetPreparsedData(handle, &preparsedData);
     if (ok) {
-        ok = HidP_GetCaps(preparsedData, &caps) == HIDP_STATUS_SUCCESS && caps.UsagePage == HIDPP_USAGE_PAGE &&
+        ok = HidP_GetCaps(preparsedData, &caps) == HIDP_STATUS_SUCCESS &&
+            (caps.UsagePage == HIDPP_USAGE_PAGE || caps.UsagePage == HIDPP_USAGE_PAGE_ALT) &&
             (caps.InputReportByteLength == HIDPP_SHORT_LEN ||
              (caps.InputReportByteLength == HIDPP_LONG_LEN && caps.OutputReportByteLength == HIDPP_LONG_LEN));
         HidD_FreePreparsedData(preparsedData);
@@ -223,6 +226,7 @@ static BOOL ReadCandidate(HidCandidate *candidate)
 
     if (ok) {
         candidate->pid = attributes.ProductID;
+        candidate->usagePage = caps.UsagePage;
         candidate->usage = caps.Usage;
         candidate->inputReportBytes = caps.InputReportByteLength;
         candidate->outputReportBytes = caps.OutputReportByteLength;
@@ -1000,7 +1004,7 @@ static int PrintListDevices(void)
             DisplayStringOrFallback(candidate->product, L"Logitech HID device"),
             LOGITECH_VID,
             candidate->pid,
-            HIDPP_USAGE_PAGE,
+            candidate->usagePage,
             candidate->usage,
             candidate->inputReportBytes,
             candidate->outputReportBytes,

@@ -48,6 +48,7 @@ The tray icon is a standing battery whose fill shows the level; hover over it fo
 - The fill is **green** above 50 %, **amber** 21–50 %, **red** at 20 % and below.
 - A **blue** fill means the device is charging.
 - An empty battery means there is no reading yet, for example when the mouse has been asleep since the tray started.
+- Prefer an icon without colours? Untick **Color icon** in the right-click menu. The fill then matches the outline, so only its height shows the level, and charging looks the same as not charging; the tooltip still tells you.
 - With several devices, the icon shows the lowest battery among the connected ones, and the tooltip lists every device. A device that is asleep or switched off keeps its last value, marked "(offline)".
 
 Right-click the icon for the details of each device:
@@ -59,6 +60,7 @@ Right-click the icon for the details of each device:
 | Hover | Tooltip with each device's battery level and state. |
 | Right-click | Reads fresh values and opens the menu with battery, DPI, and onboard profile for each device. |
 | Keyboard | Press **Win+B**, use the arrow keys to reach the icon, then **Shift+F10** opens the same menu. |
+| Color icon menu item | Switches between the coloured and the colourless icon. The choice is remembered. |
 | Refresh menu item | Detects devices again and re-reads everything. |
 | Exit menu item | Closes the tray app. The startup entry stays in place, so it will run again at next logon unless you uninstall. |
 
@@ -85,7 +87,7 @@ Run the installer again and click **Uninstall**, or:
 SuperLightBatteryInstaller.exe --uninstall
 ```
 
-This deletes the files, removes the startup shortcut and stops the running tray.
+This deletes the files, removes the startup shortcut and the saved icon setting, and stops the running tray.
 
 ## CLI
 

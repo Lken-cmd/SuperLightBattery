@@ -155,7 +155,8 @@ static BYTE g_swId = HIDPP_CLI_SW_ID;
 static DWORD g_replyTimeoutMs = HIDPP_REPLY_TIMEOUT_MS;
 static BOOL g_rescanPending = FALSE;
 static BOOL g_trayDirty = FALSE;
-static BOOL g_colorIcon = FALSE;
+/* Tray menu setting, kept in the registry: FALSE draws the fill in the outline colour. */
+static BOOL g_colorIcon = TRUE;
 /* Set only in tray mode; open devices are then registered for removal requests. */
 static HWND g_trayWindow = NULL;
 
@@ -1247,6 +1248,7 @@ typedef struct IconTheme {
 static const IconTheme ICON_THEME_DARK_COLOR = {0xFFFFFF, 0x6CCB5F, 0xFCE100, 0xFF99A4, 0x60CDFF};
 static const IconTheme ICON_THEME_LIGHT_COLOR = {0x1A1A1A, 0x0F7B0F, 0x9D5D00, 0xC42B1C, 0x005FB7};
 
+/* Colourless: the fill uses the ink colour, so only its height shows the level. */
 static const IconTheme ICON_THEME_DARK_MONO = {0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF};
 static const IconTheme ICON_THEME_LIGHT_MONO = {0x1A1A1A, 0x1A1A1A, 0x1A1A1A, 0x1A1A1A, 0x1A1A1A};
 
@@ -1291,8 +1293,9 @@ static float RoundedRectCoverage(int x, int y, float left, float top, float righ
 
 static void RenderBatteryIcon(DWORD *pixels, int size, int percent, BOOL charging, BOOL lightTaskbar)
 {
-    // const IconTheme *theme = lightTaskbar ? &ICON_THEME_LIGHT : &ICON_THEME_DARK;
-    const IconTheme *theme = g_colorIcon ? (lightTaskbar ? &ICON_THEME_LIGHT_MONO : &ICON_THEME_DARK_MONO) : (lightTaskbar ? &ICON_THEME_LIGHT_COLOR : &ICON_THEME_DARK_COLOR);
+    const IconTheme *theme = g_colorIcon
+        ? (lightTaskbar ? &ICON_THEME_LIGHT_COLOR : &ICON_THEME_DARK_COLOR)
+        : (lightTaskbar ? &ICON_THEME_LIGHT_MONO : &ICON_THEME_DARK_MONO);
     /* A standing battery on whole pixels keeps the edges sharp; only the corners are antialiased. */
     int stroke = max(1, size / 16);
     int bodyWidth = (size * 10 + 8) / 16;
@@ -1622,21 +1625,22 @@ static void RunPendingWork(HWND hwnd)
     }
 }
 
+/* Without a saved value the defaults stay in place. */
 static void LoadSettings(void)
 {
-  DWORD value = 0;
-  DWORD bytes = sizeof(value);
+    DWORD value = 0;
+    DWORD bytes = sizeof(value);
 
-  if(RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, SETTINGS_COLOR_VALUE, RRF_RT_REG_DWORD, NULL, &value, &bytes) == ERROR_SUCCESS) {
-    g_colorIcon = value != 0;
-  }
+    if (RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, SETTINGS_COLOR_VALUE, RRF_RT_REG_DWORD, NULL, &value, &bytes) == ERROR_SUCCESS) {
+        g_colorIcon = value != 0;
+    }
 }
 
-static void SaveColorSettings(void)
+static void SaveSettings(void)
 {
-  DWORD value = g_colorIcon ? 1 : 0;
+    DWORD value = g_colorIcon ? 1 : 0;
 
-  (void)RegSetKeyValueW(HKEY_CURRENT_USER, SETTINGS_KEY, SETTINGS_COLOR_VALUE, REG_DWORD, &value, sizeof(value));
+    (void)RegSetKeyValueW(HKEY_CURRENT_USER, SETTINGS_KEY, SETTINGS_COLOR_VALUE, REG_DWORD, &value, sizeof(value));
 }
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1668,7 +1672,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         switch (LOWORD(wParam)) {
         case TRAY_MENU_COLOR_TOGGLE:
             g_colorIcon = !g_colorIcon;
-            SaveColorSettings();
+            SaveSettings();
             g_trayDirty = TRUE;
             return 0;
         case TRAY_MENU_REFRESH:

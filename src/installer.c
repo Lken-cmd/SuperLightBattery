@@ -18,6 +18,8 @@
 #define RUN_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define STARTUP_APPROVED_RUN_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
 #define STARTUP_APPROVED_FOLDER_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder"
+/* Where the tray app keeps its settings; must match SETTINGS_KEY in superlightbattery.c. */
+#define SETTINGS_KEY_PATH L"Software\\SuperLightBattery"
 
 #define INSTALLER_CLASS_NAME L"SuperLightBatteryInstallerWindow"
 #define ID_BTN_INSTALL   1001
@@ -379,6 +381,8 @@ static BOOL DoUninstall(WCHAR *errorMessage, size_t errorMessageChars)
     DeleteStartupApprovalValue(STARTUP_APPROVED_FOLDER_KEY_PATH, STARTUP_SHORTCUT);
     DeleteStartupShortcut();
     RequestTrayExit();
+    /* The key holds only values, so this removes every saved setting. */
+    (void)RegDeleteKeyW(HKEY_CURRENT_USER, SETTINGS_KEY_PATH);
 
     if (!GetInstallDirectory(installDir, ARRAYSIZE(installDir)) ||
         FAILED(StringCchPrintfW(destApp, ARRAYSIZE(destApp), L"%s\\%s", installDir, APP_EXE)) ||

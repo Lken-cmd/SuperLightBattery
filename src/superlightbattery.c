@@ -51,8 +51,12 @@
 #define TRAY_UID 1
 #define TRAY_RESCAN_TIMER 1
 #define TRAY_RESCAN_DELAY_MS 5000
+#define TRAY_MENU_COLOR_TOGGLE 1001
 #define TRAY_MENU_REFRESH 1002
 #define TRAY_MENU_EXIT 1003
+
+#define SETTINGS_KEY L"Software\\SuperLightBattery"
+#define SETTINGS_COLOR_VALUE L"ColorIcon"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -151,6 +155,7 @@ static BYTE g_swId = HIDPP_CLI_SW_ID;
 static DWORD g_replyTimeoutMs = HIDPP_REPLY_TIMEOUT_MS;
 static BOOL g_rescanPending = FALSE;
 static BOOL g_trayDirty = FALSE;
+static BOOL g_colorIcon = FALSE;
 /* Set only in tray mode; open devices are then registered for removal requests. */
 static HWND g_trayWindow = NULL;
 
@@ -1239,8 +1244,11 @@ typedef struct IconTheme {
 } IconTheme;
 
 /* Windows 11 system colours: ink is the outline in the taskbar's text colour. */
-static const IconTheme ICON_THEME_DARK = {0xFFFFFF, 0x6CCB5F, 0xFCE100, 0xFF99A4, 0x60CDFF};
-static const IconTheme ICON_THEME_LIGHT = {0x1A1A1A, 0x0F7B0F, 0x9D5D00, 0xC42B1C, 0x005FB7};
+static const IconTheme ICON_THEME_DARK_COLOR = {0xFFFFFF, 0x6CCB5F, 0xFCE100, 0xFF99A4, 0x60CDFF};
+static const IconTheme ICON_THEME_LIGHT_COLOR = {0x1A1A1A, 0x0F7B0F, 0x9D5D00, 0xC42B1C, 0x005FB7};
+
+static const IconTheme ICON_THEME_DARK_MONO = {0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF};
+static const IconTheme ICON_THEME_LIGHT_MONO = {0x1A1A1A, 0x1A1A1A, 0x1A1A1A, 0x1A1A1A, 0x1A1A1A};
 
 static float Clamp01(float value)
 {
@@ -1283,7 +1291,8 @@ static float RoundedRectCoverage(int x, int y, float left, float top, float righ
 
 static void RenderBatteryIcon(DWORD *pixels, int size, int percent, BOOL charging, BOOL lightTaskbar)
 {
-    const IconTheme *theme = lightTaskbar ? &ICON_THEME_LIGHT : &ICON_THEME_DARK;
+    // const IconTheme *theme = lightTaskbar ? &ICON_THEME_LIGHT : &ICON_THEME_DARK;
+    const IconTheme *theme = g_colorIcon ? (lightTaskbar ? &ICON_THEME_LIGHT_MONO : &ICON_THEME_DARK_MONO) : (lightTaskbar ? &ICON_THEME_LIGHT_COLOR : &ICON_THEME_DARK_COLOR);
     /* A standing battery on whole pixels keeps the edges sharp; only the corners are antialiased. */
     int stroke = max(1, size / 16);
     int bodyWidth = (size * 10 + 8) / 16;
@@ -1587,6 +1596,7 @@ static void ShowTrayMenu(HWND hwnd, POINT anchor)
     }
 
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (g_colorIcon ? MF_CHECKED : MF_UNCHECKED), TRAY_MENU_COLOR_TOGGLE, L"Color icon");
     AppendMenuW(menu, MF_STRING, TRAY_MENU_REFRESH, L"Refresh");
     AppendMenuW(menu, MF_STRING, TRAY_MENU_EXIT, L"Exit");
 
@@ -1612,6 +1622,23 @@ static void RunPendingWork(HWND hwnd)
     }
 }
 
+static void LoadSettings(void)
+{
+  DWORD value = 0;
+  DWORD bytes = sizeof(value);
+
+  if(RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, SETTINGS_COLOR_VALUE, RRF_RT_REG_DWORD, NULL, &value, &bytes) == ERROR_SUCCESS) {
+    g_colorIcon = value != 0;
+  }
+}
+
+static void SaveColorSettings(void)
+{
+  DWORD value = g_colorIcon ? 1 : 0;
+
+  (void)RegSetKeyValueW(HKEY_CURRENT_USER, SETTINGS_KEY, SETTINGS_COLOR_VALUE, REG_DWORD, &value, sizeof(value));
+}
+
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (g_taskbarCreatedMessage != 0 && msg == g_taskbarCreatedMessage) {
@@ -1622,6 +1649,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     switch (msg) {
     case WM_CREATE:
         g_trayWindow = hwnd;
+        LoadSettings();
         RegisterHidDeviceNotifications(hwnd);
         UpdateTray(hwnd);
         g_rescanPending = TRUE;
@@ -1638,6 +1666,11 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
+        case TRAY_MENU_COLOR_TOGGLE:
+            g_colorIcon = !g_colorIcon;
+            SaveColorSettings();
+            g_trayDirty = TRUE;
+            return 0;
         case TRAY_MENU_REFRESH:
             RequestFullRefresh();
             return 0;
